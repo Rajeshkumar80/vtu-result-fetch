@@ -68,6 +68,17 @@ let timerInterval = null;
 let fetchStartTime = null;
 
 function logMsg(msg) { logBox.textContent += msg; logBox.scrollTop = logBox.scrollHeight; }
+const USN_PATTERN = /^[A-Z0-9]{10}$/;
+function validateUSNs(raw) {
+    const lines = raw.replace(/,/g, "\n").split("\n").map(x => x.trim().toUpperCase()).filter(x => x.length > 0);
+    const valid = [];
+    const invalid = [];
+    lines.forEach(u => {
+        if (USN_PATTERN.test(u)) valid.push(u);
+        else invalid.push(u);
+    });
+    return { valid, invalid };
+}
 function buildCreditUI() {
     const panel = document.getElementById("sgpa_panel");
     const fields = document.getElementById("credit_fields");
@@ -132,13 +143,32 @@ document.getElementById("import_button").onclick = () => {
     socket.emit("import-csv");
 };
 document.getElementById("start_button").onclick = () => {
-    logBox.textContent = "";
-    document.getElementById("download_button").style.display = "none";
     const usnRaw = document.getElementById("usn_text").value;
     const url = document.getElementById("vtu_url").value;
-    const usns = usnRaw.replace(/,/g, "\n").split("\n").map(x => x.trim()).filter(x => x.length > 0);
-    if (!usns.length) { logMsg("Error: No USNs provided.\n"); return; }
-    socket.emit("start-fetch", { usns: usns, url: url });
+
+    if (!usnRaw.trim()) {
+        logMsg("Error: No USNs entered. Please type or import USNs first.\n");
+        return;
+    }
+    if (!url.trim()) {
+        logMsg("Error: No VTU URL entered.\n");
+        return;
+    }
+
+    const { valid, invalid } = validateUSNs(usnRaw);
+
+    if (invalid.length > 0) {
+        logMsg("Warning: Skipped invalid USN entries: " + invalid.join(", ") + "\n");
+    }
+    if (valid.length === 0) {
+        logMsg("Error: No valid USNs found. USN format should be 10 chars e.g. 1GD23CS001\n");
+        return;
+    }
+
+    logBox.textContent = "";
+    document.getElementById("download_button").style.display = "none";
+    logMsg("Fetching " + valid.length + " USN(s):\n" + valid.join("\n") + "\n\n");
+    socket.emit("start-fetch", { usns: valid, url: url });
 };
 document.getElementById("stop_button").onclick = () => {
     socket.emit("stop-fetch");

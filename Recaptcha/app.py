@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import subprocess
@@ -11,6 +12,7 @@ DEFAULT_CSV = os.path.join(BASE_DIR, "students.csv")
 RAW_DATA = os.path.join(BASE_DIR, "raw_results.csv")
 OUTPUT_EXCEL = os.path.join(BASE_DIR, "vtu_results.xlsx")
 PY = sys.executable
+USN_PATTERN = re.compile(r"^[A-Z0-9]{10}$")
 
 current_process = None
 fetch_stats = {"total": 0, "success": 0, "fail": 0}
@@ -56,27 +58,48 @@ def import_csv():
 # -----------------------------------------
 @socketio.on("start-fetch")
 def start_fetch(msg):
-    global fetch_stats
+    global fetch_stats, current_process
+
     usns = msg.get("usns", [])
     vtu_url = msg.get("url", "")
 
+    if current_process and current_process.poll() is None:
+        emit("log-message", {"data": "[Error] A fetch is already running. Stop it first.\n"})
+        return
+
     if not usns:
-        emit("log-message", {"data": "No USNs provided.\n"})
+        emit("log-message", {"data": "[Error] No USNs provided.\n"})
         return
 
     if not vtu_url:
-        emit("log-message", {"data": "No VTU URL provided.\n"})
+        emit("log-message", {"data": "[Error] No VTU URL provided.\n"})
+        return
+
+    # Validate & clean USNs server-side
+    clean = []
+    skipped = []
+    for u in usns:
+        u = str(u).strip().upper()
+        if USN_PATTERN.match(u):
+            clean.append(u)
+        else:
+            skipped.append(u)
+
+    if skipped:
+        emit("log-message", {"data": f"[Warn] Skipped invalid USN entries: {', '.join(skipped)}\n"})
+    if not clean:
+        emit("log-message", {"data": "[Error] No valid USNs. Format e.g. 1GD23CS001\n"})
         return
 
     with open(DEFAULT_CSV, "w") as f:
         f.write("USN\n")
-        for u in usns:
+        for u in clean:
             f.write(u + "\n")
 
-    fetch_stats = {"total": len(usns), "success": 0, "fail": 0}
+    fetch_stats = {"total": len(clean), "success": 0, "fail": 0}
 
-    socketio.start_background_task(target=run_scraper, vtu_url=vtu_url, total_usns=len(usns))
-    emit("fetch-started", {"total": len(usns)})
+    socketio.start_background_task(target=run_scraper, vtu_url=vtu_url, total_usns=len(clean))
+    emit("fetch-started", {"total": len(clean)})
 
 
 # -----------------------------------------
