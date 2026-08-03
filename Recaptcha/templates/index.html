@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VTU Result Fetcher</title>
+    <script src="/static/tailwind.js"></script>
+    <script src="/static/socket.io.min.js"></script>
+    <style>
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #2d3748; }
+        ::-webkit-scrollbar-thumb { background: #718096; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #a0aec0; }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-200 font-sans">
+<div class="container mx-auto p-4 md:p-8 max-w-4xl">
+    <div class="text-center mb-8">
+        <h1 class="text-4xl font-bold text-white">VTU Bulk Result Fetcher</h1>
+        <p class="text-lg text-gray-400">Enter USNs, import, or just start fetching.</p>
+    </div>
+    <div class="bg-gray-800 rounded-lg shadow-xl p-6 mb-6">
+        <label class="block text-sm font-medium text-gray-300 mb-2">VTU Results URL</label>
+        <input type="text" id="vtu_url" class="w-full p-3 bg-gray-700 border border-gray-600 rounded-md shadow-inner text-gray-200" value="https://results.vtu.ac.in/JJEcbcs25/index.php">
+    </div>
+    <div class="bg-gray-800 rounded-lg shadow-xl p-6 mb-6">
+        <div class="flex flex-col md:flex-row gap-4">
+            <div class="flex-grow">
+                <label class="block text-sm font-medium text-gray-300 mb-2">USNs (comma-separated)</label>
+                <textarea id="usn_text" rows="10" class="w-full p-3 bg-gray-700 border border-gray-600 rounded-md shadow-inner text-gray-200" placeholder="1GD22CS001, 1GD22CS002..."></textarea>
+            </div>
+            <div class="flex-shrink-0 flex flex-row md:flex-col justify-start md:w-40 gap-4">
+                <button id="import_button" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-md shadow-md">Import CSV</button>
+                <button id="start_button" class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-md shadow-md">Start Fetching</button>
+                <button id="download_button" style="display:none;" class="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-4 rounded-md shadow-md">Download Excel</button>
+            </div>
+        </div>
+    </div>
+    <div id="status_bar" class="bg-gray-800 rounded-lg shadow-xl p-4 mb-6 hidden">
+        <div class="flex flex-wrap items-center justify-between gap-4">
+            <div class="flex items-center gap-2">
+                <span class="text-gray-400 text-sm">Timer:</span>
+                <span id="timer_display" class="text-2xl font-mono text-green-400 font-bold">00:00</span>
+            </div>
+            <div class="flex items-center gap-2">
+                <span class="text-gray-400 text-sm">Progress:</span>
+                <span id="accuracy_display" class="text-lg text-yellow-400 font-bold">0/0</span>
+            </div>
+            <button id="stop_button" class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-md shadow-md">Stop Fetching</button>
+        </div>
+    </div>
+    <div class="bg-gray-800 rounded-lg shadow-xl p-6 mb-6">
+        <h2 class="text-2xl font-semibold text-white mb-4">Log Output</h2>
+        <pre id="log" class="w-full h-96 bg-gray-900 rounded-md p-4 overflow-y-auto text-sm text-gray-300 border border-gray-700 whitespace-pre-wrap break-words">Welcome! Click 'Import CSV' or 'Start Fetching'.</pre>
+    </div>
+    <div id="sgpa_panel" class="bg-gray-800 rounded-lg shadow-xl p-6 mb-6 hidden">
+        <h2 class="text-2xl font-semibold text-white mb-4">SGPA Calculator</h2>
+        <p class="text-gray-400 mb-4">Enter credits for each subject:</p>
+        <div id="credit_fields" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
+        <button id="calculate_sgpa_btn" class="mt-4 bg-yellow-600 hover:bg-yellow-700 text-white font-bold py-3 px-4 rounded-md shadow-md">Calculate SGPA & Update Excel</button>
+    </div>
+</div>
+<script>
+const socket = io();
+const logBox = document.getElementById("log");
+let allSubjects = new Set();
+let timerInterval = null;
+let fetchStartTime = null;
+
+function logMsg(msg) { logBox.textContent += msg; logBox.scrollTop = logBox.scrollHeight; }
+function buildCreditUI() {
+    const panel = document.getElementById("sgpa_panel");
+    const fields = document.getElementById("credit_fields");
+    fields.innerHTML = "";
+    allSubjects.forEach(sub => {
+        fields.innerHTML += `<div class="flex items-center justify-between bg-gray-700 p-3 rounded-md"><span class="font-semibold">${sub}</span><input type="number" min="0" max="10" id="credit_${sub}" class="w-20 p-2 text-black rounded-md" placeholder="Cr"></div>`;
+    });
+    panel.classList.remove("hidden");
+}
+function updateTimer() {
+    if (!fetchStartTime) return;
+    const elapsed = Math.floor((Date.now() - fetchStartTime) / 1000);
+    const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+    const s = String(elapsed % 60).padStart(2, '0');
+    document.getElementById("timer_display").textContent = m + ":" + s;
+}
+
+socket.on("log-message", msg => {
+    logMsg(msg.data);
+    if (msg.data.startsWith("[SUBJECTS]:")) {
+        const list = msg.data.replace("[SUBJECTS]:", "").trim().split(",");
+        list.forEach(s => allSubjects.add(s));
+        buildCreditUI();
+    }
+});
+socket.on("csv-data", data => { document.getElementById("usn_text").value = data.usns; });
+socket.on("fetch-started", data => {
+    document.getElementById("status_bar").classList.remove("hidden");
+    document.getElementById("stop_button").disabled = false;
+    document.getElementById("stop_button").textContent = "Stop Fetching";
+    document.getElementById("stop_button").style.display = "block";
+    document.getElementById("start_button").style.display = "none";
+    document.getElementById("download_button").style.display = "none";
+    fetchStartTime = Date.now();
+    document.getElementById("timer_display").textContent = "00:00";
+    const total = data && data.total ? data.total : "?";
+    document.getElementById("accuracy_display").textContent = "0/" + total;
+    if (timerInterval) clearInterval(timerInterval);
+    timerInterval = setInterval(updateTimer, 1000);
+});
+socket.on("fetch-progress", data => {
+    const done = (data.success || 0) + (data.fail || 0);
+    const total = data.total || "?";
+    document.getElementById("accuracy_display").textContent = done + "/" + total;
+});
+socket.on("fetch-complete", data => {
+    if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+    document.getElementById("stop_button").style.display = "none";
+    document.getElementById("start_button").style.display = "block";
+    if (data) {
+        const done = (data.success || 0) + (data.fail || 0);
+        document.getElementById("accuracy_display").textContent = done + "/" + data.total;
+    }
+    logMsg("\n--- Fetch Complete ---\n");
+});
+socket.on("download-ready", () => {
+    logMsg("\n[Info] Excel ready for download.\n");
+    document.getElementById("download_button").style.display = "block";
+});
+document.getElementById("import_button").onclick = () => {
+    logMsg("Importing from students.csv...\n");
+    socket.emit("import-csv");
+};
+document.getElementById("start_button").onclick = () => {
+    logBox.textContent = "";
+    document.getElementById("download_button").style.display = "none";
+    const usnRaw = document.getElementById("usn_text").value;
+    const url = document.getElementById("vtu_url").value;
+    const usns = usnRaw.replace(/,/g, "\n").split("\n").map(x => x.trim()).filter(x => x.length > 0);
+    if (!usns.length) { logMsg("Error: No USNs provided.\n"); return; }
+    socket.emit("start-fetch", { usns: usns, url: url });
+};
+document.getElementById("stop_button").onclick = () => {
+    socket.emit("stop-fetch");
+    document.getElementById("stop_button").disabled = true;
+    document.getElementById("stop_button").textContent = "Stopping...";
+};
+document.getElementById("calculate_sgpa_btn").onclick = () => {
+    let creditMap = {};
+    allSubjects.forEach(sub => {
+        const v = document.getElementById(`credit_${sub}`).value;
+        if (!v) { alert("Enter credits for subject: " + sub); return; }
+        creditMap[sub] = parseInt(v);
+    });
+    socket.emit("sgpa-credits", { credits: creditMap });
+    logMsg("\n[SGPA] Credits sent to backend. Excel will include SGPA.\n");
+};
+document.getElementById("download_button").onclick = () => { window.location.href = "/download"; };
+</script>
+</body>
+</html>
