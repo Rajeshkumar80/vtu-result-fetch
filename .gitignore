@@ -31,3 +31,7 @@ build/
 # Windows
 Thumbs.db
 Desktop.ini
+
+# Server logs
+server_*.log
+

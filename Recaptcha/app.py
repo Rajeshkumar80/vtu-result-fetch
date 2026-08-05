@@ -1,21 +1,27 @@
+import io
 import os
 import re
 import sys
 import time
 import subprocess
 import pandas as pd
-from flask import Flask, render_template, send_from_directory
+from datetime import datetime
+from flask import Flask, render_template, send_from_directory, send_file
 from flask_socketio import SocketIO, emit
+import db
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_SCRIPT = os.path.join(BASE_DIR, "bulk_fetcher_6.py")
 DEFAULT_CSV = os.path.join(BASE_DIR, "students.csv")
 RAW_DATA = os.path.join(BASE_DIR, "raw_results.csv")
+RAW_SUMMARY = os.path.join(BASE_DIR, "raw_summary.csv")
 OUTPUT_EXCEL = os.path.join(BASE_DIR, "vtu_results.xlsx")
 PY = sys.executable
 USN_PATTERN = re.compile(r"^[A-Z0-9]{10}$")
 
 current_process = None
 fetch_stats = {"total": 0, "success": 0, "fail": 0}
+current_run_id = None
 
 app = Flask(__name__)
 socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
@@ -31,10 +37,64 @@ def index():
 
 @app.route("/download")
 def download():
+    """Serve the latest vtu_results.xlsx with caching fully disabled so a
+    browser can never return a stale copy of a previous run's file."""
     try:
-        return send_from_directory(BASE_DIR, os.path.basename(OUTPUT_EXCEL), as_attachment=True)
+        resp = send_from_directory(
+            BASE_DIR, os.path.basename(OUTPUT_EXCEL),
+            as_attachment=True, conditional=False
+        )
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
     except FileNotFoundError:
         return "Excel not generated yet", 404
+
+
+@app.route("/export-batch/<batch_id>")
+def export_batch(batch_id):
+    """Regenerate an .xlsx from MongoDB data for a saved batch (independent of
+    the live vtu_results.xlsx file)."""
+    batch, students = db.fetch_batch_with_students(batch_id)
+    if batch is None or students is None:
+        return "Batch not found", 404
+
+    df = students_to_pivot_df(students)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    buf.seek(0)
+
+    fname = f"vtu_results_{batch.get('department','')}_{batch.get('semester','')}_{batch.get('scheme','')}_{batch.get('year','')}.xlsx"
+    resp = send_file(
+        buf, as_attachment=True,
+        download_name=fname,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        conditional=False
+    )
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
+
+
+def students_to_pivot_df(students):
+    """Turn DB student docs into the same pivot shape as the live Excel."""
+    rows = []
+    for s in students:
+        row = {
+            "USN": s.get("usn", ""),
+            "Name": s.get("name", ""),
+            "Percentage": s.get("percentage"),
+            "Result Status": s.get("result_status", ""),
+        }
+        for sub in s.get("subjects", []):
+            code = sub.get("code", "")
+            row[f"{code} - Internal Marks"] = sub.get("internal")
+            row[f"{code} - External Marks"] = sub.get("external")
+            row[f"{code} - Total Marks"] = sub.get("total")
+            row[f"{code} - Result"] = sub.get("result")
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 # -----------------------------------------
@@ -58,7 +118,7 @@ def import_csv():
 # -----------------------------------------
 @socketio.on("start-fetch")
 def start_fetch(msg):
-    global fetch_stats, current_process
+    global fetch_stats, current_process, current_run_id
 
     usns = msg.get("usns", [])
     vtu_url = msg.get("url", "")
@@ -97,9 +157,21 @@ def start_fetch(msg):
             f.write(u + "\n")
 
     fetch_stats = {"total": len(clean), "success": 0, "fail": 0}
+    current_run_id = time.strftime("%Y%m%d-%H%M%S")
 
-    socketio.start_background_task(target=run_scraper, vtu_url=vtu_url, total_usns=len(clean))
-    emit("fetch-started", {"total": len(clean)})
+    emit("log-message", {"data": f"[Run {current_run_id}] Fetch started — {len(clean)} USN(s).\n"})
+
+    # Clear stale outputs from previous runs so old data never leaks into the new fetch
+    for f in (RAW_DATA, RAW_SUMMARY, OUTPUT_EXCEL):
+        try:
+            os.remove(f)
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            emit("log-message", {"data": f"[Warn] Could not clear {os.path.basename(f)} — close it if it is open in Excel.\n"})
+
+    socketio.start_background_task(target=run_scraper, vtu_url=vtu_url, total_usns=len(clean), run_id=current_run_id)
+    emit("fetch-started", {"total": len(clean), "run_id": current_run_id})
 
 
 # -----------------------------------------
@@ -118,9 +190,9 @@ def stop_fetch():
 # -----------------------------------------
 # RUN SCRAPER WITH URL ARG
 # -----------------------------------------
-def run_scraper(vtu_url, total_usns):
+def run_scraper(vtu_url, total_usns, run_id):
     global current_process, fetch_stats
-    cmd = [PY, BACKEND_SCRIPT, vtu_url]
+    cmd = [PY, BACKEND_SCRIPT, vtu_url, run_id]
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -129,6 +201,7 @@ def run_scraper(vtu_url, total_usns):
         cwd=BASE_DIR
     )
     current_process = process
+    started = time.time()
 
     for line in iter(process.stdout.readline, ""):
         socketio.emit("log-message", {"data": line})
@@ -144,67 +217,172 @@ def run_scraper(vtu_url, total_usns):
 
     socketio.emit("fetch-complete", dict(fetch_stats))
 
+    # Explicit write confirmation: only advertise the download if the Excel was
+    # actually rewritten during this run (mtime newer than when we started).
+    fresh = False
     if os.path.exists(OUTPUT_EXCEL):
+        try:
+            fresh = os.path.getmtime(OUTPUT_EXCEL) >= started - 1
+        except OSError:
+            fresh = False
+
+    if fresh:
+        mtime = os.path.getmtime(OUTPUT_EXCEL)
+        socketio.emit("log-message", {"data": f"[Run {run_id}] Excel verified fresh (mtime {time.strftime('%H:%M:%S', time.localtime(mtime))}).\n"})
         socketio.emit("download-ready")
+    else:
+        socketio.emit("log-message", {"data": f"\n[Run {run_id}] [Error] No fresh results were generated — check the logs above (vtu_results.xlsx may be open in Excel, or all USNs failed).\n"})
 
 
 # -----------------------------------------
-# SGPA CALCULATION
+# MONGODB EVENTS
 # -----------------------------------------
-def marks_to_gp(m):
+@socketio.on("get-db-status")
+def get_db_status():
+    emit("db-status", {"connected": db.is_connected(), "message": db.status_msg})
+
+
+def _to_num(v):
     try:
-        m = int(m)
-    except:
-        return 0
-
-    if m >= 90: return 10
-    if m >= 80: return 9
-    if m >= 70: return 8
-    if m >= 60: return 7
-    if m >= 50: return 6
-    if m >= 45: return 5
-    if m >= 40: return 4
-    return 0
+        f = float(v)
+        return int(f) if f.is_integer() else f
+    except (TypeError, ValueError):
+        return None
 
 
-@socketio.on("sgpa-credits")
-def sgpa_calc(data):
-    credits = data.get("credits", {})
+def build_db_payload(year, scheme, semester, department):
+    """Read the just-fetched raw CSVs and build (batch_doc, student_docs).
+    Returns (None, error_message) on any failure."""
+    if not os.path.exists(RAW_DATA) or not os.path.exists(RAW_SUMMARY):
+        return None, "No fetched data found. Run a fetch first."
 
-    if not os.path.exists(RAW_DATA):
-        emit("log-message", {"data": "[SGPA ERROR] raw_results.csv not found\n"})
+    try:
+        subs = pd.read_csv(RAW_DATA)
+        summ = pd.read_csv(RAW_SUMMARY)
+    except Exception as e:
+        return None, f"Could not read raw CSVs: {e}"
+
+    if subs.empty or summ.empty:
+        return None, "Raw CSVs are empty — nothing to save."
+
+    subs["USN"] = subs["USN"].astype(str).str.strip().str.upper()
+    summ["USN"] = summ["USN"].astype(str).str.strip().str.upper()
+    summ_map = {r["USN"]: r for _, r in summ.iterrows()}
+
+    subject_codes = sorted(subs["Subject Code"].dropna().unique().tolist())
+    usns = sorted(subs["USN"].dropna().unique().tolist())
+    prefix = re.sub(r"\d+$", "", usns[0]) if usns else ""
+
+    student_docs = []
+    for usn in usns:
+        group = subs[subs["USN"] == usn]
+        name = ""
+        if not group.empty:
+            name = str(group.iloc[0].get("Name", "") or "").strip()
+        srow = summ_map.get(usn)
+        percentage = None
+        if srow is not None and pd.notna(srow.get("percentage")):
+            percentage = round(float(srow["percentage"]), 2)
+
+        subjects = []
+        has_fail = False
+        for _, r in group.iterrows():
+            result = str(r.get("Result", "") or "").strip()
+            if result == "F":
+                has_fail = True
+            subjects.append({
+                "code": str(r["Subject Code"]).strip(),
+                "subject_name": str(r.get("Subject Name", "") or "").strip(),
+                "internal": _to_num(r.get("Internal Marks")),
+                "external": _to_num(r.get("External Marks")),
+                "total": _to_num(r.get("Total Marks")),
+                "result": result,
+            })
+
+        student_docs.append({
+            "usn": usn,
+            "name": name,
+            "subjects": subjects,
+            "percentage": percentage,
+            "result_status": "FAIL" if has_fail else "PASS",
+        })
+
+    batch_doc = {
+        "year": str(year).strip(),
+        "scheme": str(scheme).strip(),
+        "semester": str(semester).strip(),
+        "department": str(department).strip(),
+        "saved_at": datetime.utcnow(),
+        "usn_prefix": prefix,
+        "student_count": len(student_docs),
+        "subjects": subject_codes,
+        "run_id": current_run_id,
+    }
+    return batch_doc, student_docs
+
+
+@socketio.on("save-to-db")
+def save_to_db(data):
+    year = str(data.get("year", "")).strip()
+    scheme = str(data.get("scheme", "")).strip()
+    semester = str(data.get("semester", "")).strip()
+    department = str(data.get("department", "")).strip()
+
+    if not db.is_connected():
+        emit("log-message", {"data": f"[DB ERROR] MongoDB not available: {db.status_msg}\n"})
         return
 
-    df = pd.read_csv(RAW_DATA)
-    sgpa_map = {}
+    if not (year and scheme and semester and department):
+        emit("log-message", {"data": "[DB ERROR] year, scheme, semester and department are all required.\n"})
+        return
 
-    for usn, group in df.groupby("USN"):
-        total_pts = 0
-        total_cr = 0
+    batch_doc, student_docs = build_db_payload(year, scheme, semester, department)
+    if batch_doc is None:
+        emit("log-message", {"data": f"[DB ERROR] {student_docs}\n"})
+        return
 
-        for _, row in group.iterrows():
-            sub = row["Subject Code"]
-            if sub not in credits:
-                continue
+    batch_id, added, merged, total = db.save_batch(batch_doc, student_docs)
+    if batch_id is None:
+        emit("log-message", {"data": f"[DB ERROR] Save failed: {added}\n"})
+        return
 
-            cr = credits[sub]
-            gp = marks_to_gp(row["Total Marks"])
+    if merged:
+        emit("log-message", {
+            "data": f"[DB] Merged into batch {batch_id} — {added} new student(s), total {total}.\n"
+        })
+    else:
+        emit("log-message", {
+            "data": f"[DB] Saved new batch {batch_id} — {total} students, {len(batch_doc['subjects'])} subjects.\n"
+        })
+    emit("save-to-db-complete", {
+        "batch_id": str(batch_id),
+        "student_count": total,
+        "added_count": added,
+        "merged": merged,
+    })
 
-            total_pts += gp * cr
-            total_cr += cr
 
-        sgpa = round(total_pts / total_cr, 2) if total_cr else 0
-        sgpa_map[usn] = sgpa
+@socketio.on("get-batches")
+def get_batches():
+    if not db.is_connected():
+        emit("batches", {"batches": [], "error": db.status_msg})
+        return
+    batches = db.fetch_batches()
+    emit("batches", {"batches": batches, "error": None})
 
-    # Update Excel file
-    excel = pd.read_excel(OUTPUT_EXCEL)
-    excel["SGPA"] = excel["USN"].apply(lambda u: sgpa_map.get(u, 0))
-    excel.to_excel(OUTPUT_EXCEL, index=False)
 
-    emit("log-message", {"data": "\n[SGPA] SGPA added to Excel.\n"})
-    emit("download-ready")
+@socketio.on("get-batch-results")
+def get_batch_results(data):
+    batch_id = str(data.get("batch_id", ""))
+    if not db.is_connected():
+        emit("batch-results", {"batch": None, "students": [], "error": db.status_msg})
+        return
+    batch, students = db.fetch_batch_with_students(batch_id)
+    emit("batch-results", {"batch": batch, "students": students, "error": None})
 
 
 # -----------------------------------------
 if __name__ == "__main__":
+    db.init_db()
+    print(f"[MongoDB] status={db.status} — {db.status_msg}")
     socketio.run(app, host="127.0.0.1", port=5000, allow_unsafe_werkzeug=True, use_reloader=False)

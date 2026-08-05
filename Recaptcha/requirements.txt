@@ -9,3 +9,5 @@ pandas
 beautifulsoup4
 lxml
 scikit-learn
+pymongo
+python-dotenv

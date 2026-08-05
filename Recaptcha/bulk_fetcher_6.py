@@ -3,6 +3,7 @@
 # Fixes: robust alert handling, safe refresh, stable CAPTCHA retry loop.
 
 import os
+import re
 import sys
 import time
 import traceback
@@ -30,6 +31,9 @@ VTU_RESULTS_URL = "https://results.vtu.ac.in/JJEcbcs25/index.php"
 # Accept URL from app.py if provided
 if len(sys.argv) > 1:
     VTU_RESULTS_URL = sys.argv[1]
+
+# Unique run identifier (passed by app.py) — appears in logs with [SUBJECTS]:
+RUN_ID = sys.argv[2] if len(sys.argv) > 2 else time.strftime("%Y%m%d-%H%M%S")
 
 MODEL_FILE = "vtu_captcha_predictor.h5"
 INPUT_CSV = "students.csv"
@@ -73,18 +77,30 @@ def decode(pred):
 def scrape(html):
     soup = BeautifulSoup(html, "html.parser")
 
+    usn, name = "UNKNOWN", "UNKNOWN"
+
+    # --- Student identity: main layout (table-condensed) ---
     try:
         t = soup.find("table", {"class": "table-condensed"}).find_all("tr")
-        usn = t[0].find_all("td")[1].text.strip().replace(":", "")
-        name = t[1].find_all("td")[1].text.strip().replace(":", "")
+        usn = t[0].find_all("td")[1].text.strip().replace(":", "").strip().upper()
+        name = t[1].find_all("td")[1].text.strip().replace(":", "").strip()
     except Exception:
-        usn, name = "UNKNOWN", "UNKNOWN"
+        pass
+
+    # --- Fallback: find the USN pattern anywhere in the page ---
+    if usn == "UNKNOWN" or not re.match(r"\d[A-Z]{2}\d{2}[A-Z]{2}\d{3}", usn):
+        m = re.search(r"\d[A-Z]{2}\d{2}[A-Z]{2}\d{3}", html)
+        if m:
+            usn = m.group(0)
+            print("[Info] USN recovered from page text:", usn)
 
     sub_rows = []
     total, max_total = 0, 0
 
-    try:
-        rows = soup.find("div", {"class": "divTableBody"}).find_all("div", {"class": "divTableRow"})
+    # --- Subject table: div-table layout ---
+    table_body = soup.find("div", {"class": "divTableBody"})
+    if table_body:
+        rows = table_body.find_all("div", {"class": "divTableRow"})
         for r in rows:
             c = r.find_all("div", {"class": "divTableCell"})
             if len(c) != 7 or "Subject Code" in c[0].text:
@@ -109,8 +125,38 @@ def scrape(html):
                 pass
 
             max_total += 100
-    except Exception:
-        pass
+
+    # --- Fallback: any HTML table whose header row mentions "Subject Code" ---
+    if not sub_rows:
+        for table in soup.find_all("table"):
+            header_cells = table.find_all("th")
+            headers = [h.get_text(" ", strip=True) for h in header_cells]
+            if not any("Subject Code" in h for h in headers):
+                continue
+            col = {h: i for i, h in enumerate(headers)}
+            for tr in table.find_all("tr"):
+                cells = tr.find_all("td")
+                if len(cells) < 7 or "Subject Code" in cells[0].get_text(strip=True):
+                    continue
+                cell = lambda key: cells[col[key]].get_text(strip=True) if (key in col and col[key] < len(cells)) else ""
+                code = cell("Subject Code")
+                if not code:
+                    continue
+                tmarks = cell("Total Marks") or cell("Total") or cell("Marks")
+                sub_rows.append({
+                    "Subject Code": code,
+                    "Subject Name": cell("Subject Name"),
+                    "Internal Marks": cell("Internal Marks"),
+                    "External Marks": cell("External Marks"),
+                    "Total Marks": tmarks,
+                    "Result": cell("Result"),
+                    "Announced / Updated on": cell("Announced / Updated on"),
+                })
+                try:
+                    total += int(tmarks)
+                except:
+                    pass
+                max_total += 100
 
     pct = (total / max_total * 100) if max_total else 0
 
@@ -165,6 +211,98 @@ def safe_refresh(driver):
 
 
 # -----------------------------------------
+# Data persistence: CSVs + live Excel rebuild
+# -----------------------------------------
+def save_interim(all_subs, all_summ):
+    """Persist current progress to CSVs and rebuild the Excel in real time."""
+    try:
+        if all_subs or all_summ:
+            pd.DataFrame(all_subs).to_csv(RAW_DATA, index=False)
+            pd.DataFrame(all_summ).to_csv(RAW_SUMMARY, index=False)
+            print(f"[Info] Saved progress: {len(all_subs)} subject rows, {len(all_summ)} student summaries.")
+            generate_excel()
+    except Exception as e:
+        print("[Warn] Could not save interim CSVs:", e)
+
+
+def generate_excel():
+    """Rebuild vtu_results.xlsx from raw_results.csv + raw_summary.csv (SGPA added later by app.py)."""
+    try:
+        if not os.path.exists(RAW_DATA) or not os.path.exists(RAW_SUMMARY):
+            print("[Warn] Raw CSVs not found — Excel not generated yet.")
+            return
+
+        subs_df = pd.read_csv(RAW_DATA)
+        summ_df = pd.read_csv(RAW_SUMMARY)
+
+        if subs_df.empty or summ_df.empty:
+            print("[Warn] No scraped data available — Excel not generated yet.")
+            return
+
+        subs_df.drop_duplicates(inplace=True)
+        summ_df.drop_duplicates(subset=["USN"], keep="last", inplace=True)
+
+        pivot = pd.pivot_table(
+            subs_df,
+            index=["USN", "Name"],
+            columns="Subject Code",
+            values=["Internal Marks", "External Marks", "Total Marks", "Result"],
+            aggfunc="first"
+        )
+        # flatten multiindex columns
+        pivot.columns = [f"{c2} - {c1}" for c1, c2 in pivot.columns]
+        pivot.reset_index(inplace=True)
+
+        summ_df["Percentage"] = summ_df["percentage"].apply(lambda x: f"{x:.2f}%" if isinstance(x, (int, float)) else "")
+        summ_df = summ_df.rename(columns={
+            "total_obtained": "Overall Total",
+            "total_max": "Overall Max Marks"
+        })
+
+        final = pd.merge(pivot, summ_df, on=["USN", "Name"], how="outer")
+        final.to_excel(OUTPUT_EXCEL, index=False)
+        print("[Success] Excel updated:", OUTPUT_EXCEL)
+
+    except pd.errors.EmptyDataError:
+        print("[Warn] Raw CSVs are empty — Excel not generated yet.")
+    except PermissionError:
+        print("[Error] Cannot write vtu_results.xlsx — it is open in Excel. Close it and re-run the fetch.")
+    except Exception as e:
+        print("[Error] Excel generation failed:", e)
+        traceback.print_exc()
+
+
+# -----------------------------------------
+# Browser management (with auto-restart on crash)
+# -----------------------------------------
+def start_driver():
+    """Create a fresh Chrome WebDriver."""
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service)
+
+
+def browser_alive(driver):
+    """Check whether the browser session is still usable."""
+    try:
+        driver.current_url
+        return True
+    except Exception:
+        return False
+
+
+def ensure_browser(driver):
+    """Restart the browser if it crashed (window closed, session dead, etc.)."""
+    if browser_alive(driver):
+        return driver
+    print("[Warn] Browser session is dead — restarting Chrome...")
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    return start_driver()
+
+
+# -----------------------------------------
 # MAIN
 # -----------------------------------------
 def main():
@@ -175,6 +313,16 @@ def main():
         print("Error reading students.csv:", e)
         return
 
+    # Remove stale outputs from previous runs so old data never leaks into the new fetch
+    for f in (RAW_DATA, RAW_SUMMARY, OUTPUT_EXCEL):
+        try:
+            os.remove(f)
+            print(f"[Info] Cleared stale file: {f}")
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            print(f"[Warn] Could not clear {f} — is it open in Excel? Close it and re-run the fetch.")
+
     try:
         model = tf.keras.models.load_model(MODEL_FILE)
     except Exception as e:
@@ -183,8 +331,7 @@ def main():
 
     # Start Chrome WebDriver with automatic driver management
     try:
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service)
+        driver = start_driver()
     except Exception as e:
         print("Error starting Chrome WebDriver:", e)
         return
@@ -195,6 +342,9 @@ def main():
 
     for usn in usns:
         print(f"\n--- Processing USN: {usn} ---")
+
+        driver = ensure_browser(driver)
+
         try:
             driver.get(VTU_RESULTS_URL)
         except Exception as e:
@@ -309,9 +459,36 @@ def main():
                     time.sleep(0.5)
                     continue
 
-                # If we reached here, page changed successfully — scrape it
+                # If we reached here, page changed successfully — wait until the
+                # result content is actually present in the DOM, then scrape it
                 try:
-                    (u, name), subs, summ = scrape(driver.page_source)
+                    WebDriverWait(driver, 10).until(
+                        lambda d: ("divTableBody" in d.page_source) or ("table-condensed" in d.page_source)
+                    )
+                except TimeoutException:
+                    pass  # handled below by the 0-subjects retry
+
+                try:
+                    page_html = driver.page_source
+                    (u, name), subs, summ = scrape(page_html)
+
+                    # Page loaded but no result content found — could be a slow
+                    # render, changed layout, or "result not found" page.
+                    if len(subs) == 0:
+                        try:
+                            with open("debug_page.html", "w", encoding="utf-8") as df:
+                                df.write(page_html)
+                            print("[Debug] 0 subjects scraped — page saved to debug_page.html (URL: %s)" % driver.current_url)
+                        except Exception:
+                            pass
+                        if "not found" in page_html.lower() or "no result" in page_html.lower() or "not declared" in page_html.lower():
+                            print(f"[Info] Result not found for {usn} on VTU site.")
+                            success = False
+                            break
+                        print("[Warn] Scrape returned 0 subjects — refreshing and retrying.")
+                        safe_refresh(driver)
+                        time.sleep(0.5)
+                        continue
 
                     for s in subs:
                         s["USN"] = u
@@ -346,6 +523,7 @@ def main():
 
             except TimeoutException:
                 print("[Warn] Timeout waiting for page elements. Refreshing and retrying.")
+                driver = ensure_browser(driver)
                 safe_refresh(driver)
                 time.sleep(0.5)
                 continue
@@ -353,6 +531,7 @@ def main():
             except Exception as e:
                 print("[Error] Unexpected exception in attempt loop:", e)
                 traceback.print_exc()
+                driver = ensure_browser(driver)
                 safe_refresh(driver)
                 time.sleep(0.5)
                 continue
@@ -362,12 +541,8 @@ def main():
             # Add a summary row marking the failure if desired
             all_summ.append({'USN': usn, 'Name': 'FETCH FAILED', 'percentage': 0, 'total_obtained': 0, 'total_max': 0})
 
-        # Save intermediate CSVs so partial progress is kept
-        try:
-            pd.DataFrame(all_subs).to_csv(RAW_DATA, index=False)
-            pd.DataFrame(all_summ).to_csv(RAW_SUMMARY, index=False)
-        except Exception as e:
-            print("[Warn] Could not save interim CSVs:", e)
+        # Save intermediate CSVs so partial progress is kept (Excel rebuilt live)
+        save_interim(all_subs, all_summ)
 
     # End for all USNs
     try:
@@ -376,40 +551,10 @@ def main():
         pass
 
     print("\n--- SCRAPING COMPLETE ---")
-    print("[SUBJECTS]:" + ",".join(sorted(unique)))
+    print("[SUBJECTS]:" + ",".join(sorted(unique)) + f" (run {RUN_ID})")
 
-    # Generate Excel without SGPA (SGPA added by app.py)
-    try:
-        subs_df = pd.read_csv(RAW_DATA)
-        summ_df = pd.read_csv(RAW_SUMMARY)
-
-        subs_df.drop_duplicates(inplace=True)
-        summ_df.drop_duplicates(subset=["USN"], keep="last", inplace=True)
-
-        pivot = pd.pivot_table(
-            subs_df,
-            index=["USN", "Name"],
-            columns="Subject Code",
-            values=["Internal Marks", "External Marks", "Total Marks", "Result"],
-            aggfunc="first"
-        )
-        # flatten multiindex columns
-        pivot.columns = [f"{c2} - {c1}" for c1, c2 in pivot.columns]
-        pivot.reset_index(inplace=True)
-
-        summ_df["Percentage"] = summ_df["percentage"].apply(lambda x: f"{x:.2f}%" if isinstance(x, (int, float)) else "")
-        summ_df = summ_df.rename(columns={
-            "total_obtained": "Overall Total",
-            "total_max": "Overall Max Marks"
-        })
-
-        final = pd.merge(pivot, summ_df, on=["USN", "Name"], how="outer")
-        final.to_excel(OUTPUT_EXCEL, index=False)
-
-        print("[Success] Excel generated:", OUTPUT_EXCEL)
-    except Exception as e:
-        print("[Error] Excel generation failed:", e)
-        traceback.print_exc()
+    # Generate/refresh Excel without SGPA (SGPA added by app.py)
+    generate_excel()
 
 
 if __name__ == "__main__":
