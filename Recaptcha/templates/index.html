@@ -210,6 +210,7 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
         <div class="row" style="margin-top:10px;">
           <button class="btn ghost" id="manual_add_btn">Add to list</button>
           <button class="btn ghost" id="import_btn">Import from students.csv</button>
+          <button class="btn ghost" id="clear_btn" title="Clears the current list so the next import loads fresh (no merge)">Refresh list</button>
         </div>
       </div>
     </div>
@@ -311,7 +312,12 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
 <div class="modal-overlay" id="db_modal">
   <div class="modal">
     <h2 style="margin-bottom:4px;">Save to Database</h2>
-    <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Archives the current fetch into MongoDB (fetch_batches + student_results).</p>
+    <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Archives the current fetch into MongoDB — pick an existing batch to merge into, or create a new one.</p>
+    <div class="row" style="margin-bottom:12px;">
+      <div><label class="lbl">Store into</label>
+        <select id="db_batch_sel"><option value="">— create a new batch —</option></select>
+      </div>
+    </div>
     <div class="row" style="margin-bottom:12px;">
       <div><label class="lbl">Year</label><input type="text" id="db_year" placeholder="2025"></div>
       <div><label class="lbl">Scheme</label><input type="text" id="db_scheme" placeholder="2022"></div>
@@ -411,6 +417,15 @@ $("import_btn").addEventListener("click", () => {
   socket.emit("import-csv");
 });
 
+$("clear_btn").addEventListener("click", () => {
+  usnList = [];
+  invalidList = [];
+  $("manual_text").value = "";
+  $("gen_preview").textContent = "";
+  renderList();
+  toast("List refreshed/cleared — importing again will not merge with old USNs");
+});
+
 function renderList() {
   const area = $("chip_area");
   area.innerHTML = "";
@@ -454,22 +469,56 @@ $("download_btn").addEventListener("click", () => {
 });
 
 /* ---------------- save to DB ---------------- */
-$("save_db_btn").addEventListener("click", () => $("db_modal").classList.add("open"));
+$("save_db_btn").addEventListener("click", () => {
+  $("db_modal").classList.add("open");
+  socket.emit("get-batches");
+  populateDbBatchSel();
+});
 $("db_cancel_btn").addEventListener("click", () => $("db_modal").classList.remove("open"));
 
+function populateDbBatchSel() {
+  const sel = $("db_batch_sel");
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">— create a new batch —</option>';
+  batches.forEach(b => {
+    const o = document.createElement("option");
+    o.value = b._id;
+    o.textContent = `${b.department || "?"} — Sem ${b.semester || "?"} — ${b.scheme || "?"} — ${b.year || "?"} (${b.student_count} students)`;
+    sel.appendChild(o);
+  });
+  if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+  updateMergeUI();
+}
+
+function updateMergeUI() {
+  const merging = !!$("db_batch_sel").value;
+  const b = merging ? batches.find(x => x._id === $("db_batch_sel").value) : null;
+  ["db_year", "db_scheme", "db_semester", "db_department"].forEach(id => { $(id).disabled = merging; $(id).required = !merging; });
+  if (b) {
+    $("db_year").value = b.year || "";
+    $("db_scheme").value = b.scheme || "";
+    $("db_semester").value = b.semester || "";
+    $("db_department").value = b.department || "";
+  }
+  $("db_save_btn").textContent = merging ? "Merge into this batch" : "Save batch";
+}
+$("db_batch_sel").addEventListener("change", updateMergeUI);
+
 $("db_save_btn").addEventListener("click", () => {
+  const target = $("db_batch_sel").value;
+  if (!target && (!$("db_year").value.trim() || !$("db_scheme").value.trim() || !$("db_semester").value.trim() || !$("db_department").value.trim())) {
+    toast("Fill all fields, or pick an existing batch to merge into"); return;
+  }
   const payload = {
     year: $("db_year").value.trim(),
     scheme: $("db_scheme").value.trim(),
     semester: $("db_semester").value.trim(),
     department: $("db_department").value.trim(),
+    target_batch_id: target,
   };
-  if (!payload.year || !payload.scheme || !payload.semester || !payload.department) {
-    toast("All fields are required"); return;
-  }
   socket.emit("save-to-db", payload);
   $("db_modal").classList.remove("open");
-  logMsg("[DB] Saving batch to MongoDB…\n");
+  logMsg(target ? `[DB] Merging current fetch into batch ${target}…\n` : "[DB] Saving batch to MongoDB…\n");
 });
 
 /* ---------------- socket events ---------------- */
@@ -481,7 +530,15 @@ socket.on("db-status", data => {
   else { b.textContent = "MongoDB off"; b.className = "db-badge off"; }
 });
 
-socket.on("csv-data", data => { $("manual_text").value = data.usns; });
+socket.on("csv-data", data => {
+  $("manual_text").value = data.usns;
+  const { valid, invalid } = validateUSNs(data.usns);
+  usnList = [...new Set(usnList.concat(valid))];
+  invalidList = invalidList.concat(invalid);
+  renderList();
+  logMsg(`Imported ${valid.length} USN(s) into the list below.\n`);
+  if (invalid.length) logMsg(`Skipped ${invalid.length} invalid entry/entries from CSV.\n`);
+});
 socket.on("log-message", msg => logMsg(msg.data));
 socket.on("fetch-started", data => {
   $("status_bar").style.display = "flex";
@@ -552,6 +609,7 @@ socket.on("batches", data => {
   if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
   populateFilters();
   applyBrowseFilters();
+  populateDbBatchSel();
 });
 
 $("an_batch_sel").addEventListener("change", e => {

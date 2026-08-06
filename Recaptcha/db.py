@@ -154,6 +154,48 @@ def save_batch(batch_doc, student_docs):
         return None, str(e), False, 0
 
 
+def merge_into_batch(batch_id, batch_doc, student_docs):
+    """Merge students into ONE specific existing batch chosen by the user.
+
+    Like save_batch's merge path, but the target batch is picked explicitly
+    (by _id) instead of auto-matched on (year, scheme, semester, department).
+    Only USNs not already present in that batch are appended.
+    Returns (batch_id_str, added_count, was_merged, total_students)
+    or (None, error_msg, False, 0)."""
+    if not is_connected():
+        return None, "MongoDB not connected", False, 0
+    try:
+        oid = ObjectId(batch_id)
+        existing = _batches_coll().find_one({"_id": oid})
+        if existing is None:
+            return None, "Batch not found", False, 0
+
+        existing_usns = set(
+            s["usn"] for s in _students_coll().find({"batch_id": oid}, {"usn": 1})
+        )
+        new_docs = [d for d in student_docs if d["usn"] not in existing_usns]
+        for s in new_docs:
+            s["batch_id"] = oid
+        if new_docs:
+            _students_coll().insert_many(new_docs)
+
+        total = _students_coll().count_documents({"batch_id": oid})
+        merged_subjects = sorted(
+            set(existing.get("subjects") or []) | set(batch_doc.get("subjects") or [])
+        )
+        _batches_coll().update_one(
+            {"_id": oid},
+            {"$set": {
+                "student_count": total,
+                "subjects": merged_subjects,
+                "saved_at": datetime.utcnow(),
+            }},
+        )
+        return str(oid), len(new_docs), True, total
+    except PyMongoError as e:
+        return None, str(e), False, 0
+
+
 def fetch_batches(limit=100):
     """Return saved batches, newest first."""
     if not is_connected():

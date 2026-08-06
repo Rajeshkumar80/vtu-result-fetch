@@ -327,10 +327,21 @@ def save_to_db(data):
     scheme = str(data.get("scheme", "")).strip()
     semester = str(data.get("semester", "")).strip()
     department = str(data.get("department", "")).strip()
+    target_id = str(data.get("target_batch_id", "") or "").strip()
 
     if not db.is_connected():
         emit("log-message", {"data": f"[DB ERROR] MongoDB not available: {db.status_msg}\n"})
         return
+
+    if target_id:
+        batch = db.fetch_batch(target_id)
+        if batch is None:
+            emit("log-message", {"data": f"[DB ERROR] Target batch {target_id} not found.\n"})
+            return
+        year = str(batch.get("year", "") or "").strip()
+        scheme = str(batch.get("scheme", "") or "").strip()
+        semester = str(batch.get("semester", "") or "").strip()
+        department = str(batch.get("department", "") or "").strip()
 
     if not (year and scheme and semester and department):
         emit("log-message", {"data": "[DB ERROR] year, scheme, semester and department are all required.\n"})
@@ -341,12 +352,16 @@ def save_to_db(data):
         emit("log-message", {"data": f"[DB ERROR] {student_docs}\n"})
         return
 
-    batch_id, added, merged, total = db.save_batch(batch_doc, student_docs)
+    if target_id:
+        batch_id, added, merged, total = db.merge_into_batch(target_id, batch_doc, student_docs)
+    else:
+        batch_id, added, merged, total = db.save_batch(batch_doc, student_docs)
+
     if batch_id is None:
         emit("log-message", {"data": f"[DB ERROR] Save failed: {added}\n"})
         return
 
-    if merged:
+    if merged or target_id:
         emit("log-message", {
             "data": f"[DB] Merged into batch {batch_id} — {added} new student(s), total {total}.\n"
         })

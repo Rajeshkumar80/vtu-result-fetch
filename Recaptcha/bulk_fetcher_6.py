@@ -46,7 +46,7 @@ IMG_HEIGHT = 75
 CHARACTERS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 num_to_char = {i: c for i, c in enumerate(CHARACTERS)}
 
-MAX_ATTEMPTS = 15
+MAX_ATTEMPTS = 3
 
 
 # -----------------------------------------
@@ -72,6 +72,22 @@ def decode(pred):
             break
         out += num_to_char.get(x.numpy(), "")
     return out[:6]
+
+
+def predict_captcha(model, img_batch):
+    """Faster single-image inference: direct eager call instead of model.predict().
+
+    model.predict() has extra overhead (data adaption, step loops) that is
+    significant when solving one CAPTCHA at a time. Calling the model directly
+    runs a single forward pass. Falls back to predict() if anything fails.
+    """
+    try:
+        out = model(img_batch, training=False)
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+        return out.numpy() if hasattr(out, "numpy") else np.asarray(out)
+    except Exception:
+        return model.predict(img_batch, verbose=0)
 
 
 def scrape(html):
@@ -363,24 +379,13 @@ def main():
                 img = driver.find_element(By.XPATH, "//img[contains(@src,'vtu_captcha.php')]")
                 btn = driver.find_element(By.ID, "submit")
 
-                # Fill USN
-                try:
-                    box.clear()
-                except Exception:
-                    pass
-                try:
-                    cbox.clear()
-                except Exception:
-                    pass
-                box.send_keys(usn)
-
-                # Capture captcha image
+                # --- Step 1: solve the CAPTCHA first (before filling anything) ---
                 img.screenshot("cap.png")
 
                 # Preprocess & predict
                 try:
                     prep = preprocess("cap.png")
-                    pred = decode(model.predict(prep, verbose=0))
+                    pred = decode(predict_captcha(model, prep))
                 except Exception as e:
                     print("[Warn] CAPTCHA preprocess/predict failed:", e)
                     pred = ""
@@ -391,8 +396,19 @@ def main():
                 if not isinstance(pred, str) or len(pred) != 6:
                     print("[Info] Pred length invalid, refreshing and retrying.")
                     safe_refresh(driver)
-                    time.sleep(0.5)
+                    time.sleep(0.2)
                     continue
+
+                # --- Step 2: now fill the USN and the solved CAPTCHA ---
+                try:
+                    cbox.clear()
+                except Exception:
+                    pass
+                try:
+                    box.clear()
+                except Exception:
+                    pass
+                box.send_keys(usn)
 
                 # Enter captcha and submit
                 try:
