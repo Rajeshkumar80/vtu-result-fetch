@@ -208,6 +208,19 @@ def fetch_batches(limit=100):
         return []
 
 
+def distinct_batch_values(field):
+    """Return unique, non-empty values of a batch field (semester/scheme/year/...).
+    Used to populate filter dropdowns directly from the database."""
+    if not is_connected():
+        return []
+    try:
+        values = _batches_coll().distinct(field)
+        return [str(v) for v in values if v is not None and str(v).strip() != ""]
+    except PyMongoError as e:
+        print(f"[MongoDB] distinct_batch_values error: {e}")
+        return []
+
+
 def fetch_batch(batch_id):
     """Return one batch doc (JSON-safe) or None."""
     if not is_connected() or not ObjectId.is_valid(batch_id):

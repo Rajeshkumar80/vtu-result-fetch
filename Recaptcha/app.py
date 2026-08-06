@@ -6,7 +6,7 @@ import time
 import subprocess
 import pandas as pd
 from datetime import datetime
-from flask import Flask, render_template, send_from_directory, send_file
+from flask import Flask, render_template, send_from_directory, send_file, make_response, jsonify
 from flask_socketio import SocketIO, emit
 import db
 
@@ -32,7 +32,11 @@ socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 # -----------------------------------------
 @app.route("/")
 def index():
-    return render_template("index.html")
+    resp = make_response(render_template("index.html"))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route("/download")
@@ -95,6 +99,42 @@ def students_to_pivot_df(students):
             row[f"{code} - Result"] = sub.get("result")
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+# -----------------------------------------
+# FILTER OPTIONS API (populates Browse dropdowns from the database)
+# -----------------------------------------
+SEMESTER_PRESETS = [str(s) for s in range(1, 9)]
+SCHEME_PRESETS = [str(y) for y in range(2018, 2027)]
+YEAR_PRESETS = [str(y) for y in range(2019, 2027)]
+
+
+def _num_key(v):
+    return int(v) if v.isdigit() else float("inf")
+
+
+def _filter_values(field, presets, reverse=False):
+    """Merge static presets with distinct DB values; dedupe; numeric sort."""
+    try:
+        merged = set(presets) | set(db.distinct_batch_values(field))
+    except Exception:
+        merged = set(presets)
+    return sorted(merged, key=_num_key, reverse=reverse)
+
+
+@app.route("/api/filters/semesters")
+def filters_semesters():
+    return jsonify(_filter_values("semester", SEMESTER_PRESETS))
+
+
+@app.route("/api/filters/schemes")
+def filters_schemes():
+    return jsonify(_filter_values("scheme", SCHEME_PRESETS, reverse=True))
+
+
+@app.route("/api/filters/years")
+def filters_years():
+    return jsonify(_filter_values("year", YEAR_PRESETS))
 
 
 # -----------------------------------------
