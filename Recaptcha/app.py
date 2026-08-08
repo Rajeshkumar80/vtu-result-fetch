@@ -9,6 +9,7 @@ from datetime import datetime
 from flask import Flask, render_template, send_from_directory, send_file, make_response, jsonify
 from flask_socketio import SocketIO, emit
 import db
+from excel_header import HEADER_ROWS, DATA_HEADER_ROW, apply_header
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_SCRIPT = os.path.join(BASE_DIR, "bulk_fetcher_6.py")
@@ -67,7 +68,8 @@ def export_batch(batch_id):
     df = students_to_pivot_df(students)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False)
+        df.to_excel(writer, index=False, startrow=HEADER_ROWS)
+    _style_excel_buffer(buf, df.columns.tolist())
     buf.seek(0)
 
     fname = f"vtu_results_{batch.get('department','')}_{batch.get('semester','')}_{batch.get('scheme','')}_{batch.get('year','')}.xlsx"
@@ -79,6 +81,80 @@ def export_batch(batch_id):
     )
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
+
+
+def _style_excel_buffer(buf, columns):
+    """Apply a clean look to an xlsx already written into buf: college header
+    block, bold header on a green fill, frozen panes, per-column widths and
+    an autofilter."""
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        buf.seek(0)
+        wb = load_workbook(buf)
+        ws = wb.active
+
+        head_fill = PatternFill("solid", fgColor="1C7A5E")
+        head_font = Font(bold=True, color="FFFFFF", size=11)
+        thin = Side(style="thin", color="C8D6CE")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        for cell in ws[DATA_HEADER_ROW]:
+            cell.fill = head_fill
+            cell.font = head_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+
+        for i, col in enumerate(columns, start=1):
+            letter = ws.cell(row=DATA_HEADER_ROW, column=i).column_letter
+            if col == "USN":
+                ws.column_dimensions[letter].width = 14
+            elif col == "Name":
+                ws.column_dimensions[letter].width = 28
+            elif "Subject Name" in col:
+                ws.column_dimensions[letter].width = 34
+            elif "Result Status" in col or "Percentage" in col:
+                ws.column_dimensions[letter].width = 15
+            else:
+                ws.column_dimensions[letter].width = 12
+
+        for row in ws.iter_rows(min_row=DATA_HEADER_ROW + 1):
+            for cell in row:
+                cell.border = border
+
+        apply_header(ws, len(columns))
+        ws.freeze_panes = f"C{DATA_HEADER_ROW + 1}"
+        ws.auto_filter.ref = f"A{DATA_HEADER_ROW}:{get_column_letter(len(columns))}{ws.max_row}"
+        buf.seek(0)
+        buf.truncate()
+        wb.save(buf)
+    except Exception as e:
+        print("[Warn] Excel styling skipped:", e)
+
+
+def _grade(marks):
+    """Map total marks to a VTU grade (per the standard grade table)."""
+    try:
+        m = float(marks)
+    except (TypeError, ValueError):
+        return ""
+    if m >= 90:
+        return "O"
+    if m >= 80:
+        return "A+"
+    if m >= 70:
+        return "A"
+    if m >= 60:
+        return "B+"
+    if m >= 55:
+        return "B"
+    if m >= 50:
+        return "C"
+    if m >= 40:
+        return "P"
+    return "F"
 
 
 def students_to_pivot_df(students):
@@ -96,6 +172,7 @@ def students_to_pivot_df(students):
             row[f"{code} - Internal Marks"] = sub.get("internal")
             row[f"{code} - External Marks"] = sub.get("external")
             row[f"{code} - Total Marks"] = sub.get("total")
+            row[f"{code} - Grade"] = _grade(sub.get("total"))
             row[f"{code} - Result"] = sub.get("result")
         rows.append(row)
     return pd.DataFrame(rows)
@@ -242,6 +319,7 @@ def run_scraper(vtu_url, total_usns, run_id):
     )
     current_process = process
     started = time.time()
+    failed_usns = []
 
     for line in iter(process.stdout.readline, ""):
         socketio.emit("log-message", {"data": line})
@@ -250,12 +328,17 @@ def run_scraper(vtu_url, total_usns, run_id):
             socketio.emit("fetch-progress", dict(fetch_stats))
         elif "FAILED to fetch" in line:
             fetch_stats["fail"] += 1
+            m = re.search(r"FAILED to fetch results for USN: (\S+)", line)
+            if m:
+                failed_usns.append(m.group(1))
             socketio.emit("fetch-progress", dict(fetch_stats))
 
     process.wait()
     current_process = None
 
-    socketio.emit("fetch-complete", dict(fetch_stats))
+    complete_data = dict(fetch_stats)
+    complete_data["failed"] = failed_usns
+    socketio.emit("fetch-complete", complete_data)
 
     # Explicit write confirmation: only advertise the download if the Excel was
     # actually rewritten during this run (mtime newer than when we started).

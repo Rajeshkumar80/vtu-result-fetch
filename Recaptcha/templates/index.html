@@ -416,6 +416,7 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
       <input type="text" id="vtu_url" value="https://results.vtu.ac.in/JJEcbcs25/index.php">
       <div style="flex:0 0 auto;"><button class="btn" id="start_btn">Start Fetching</button></div>
       <div style="flex:0 0 auto;"><button class="btn warn" id="stop_btn" disabled>Stop</button></div>
+      <div style="flex:0 0 auto;"><button class="btn ghost" id="retry_btn" style="display:none;" title="Loads only the USNs that failed in the last run and starts fetching them">Retry failed</button></div>
     </div>
 
     <div class="status-bar" id="status_bar">
@@ -460,7 +461,7 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
   <div id="an_content" style="display:none;">
     <div class="rank-cards">
       <div class="rank-card hero"><div class="rk">Top scorer</div><div class="rv" id="an_top">—</div><div class="ru" id="an_top_usn"></div></div>
-      <div class="rank-card"><div class="rk">Batch average</div><div class="rv" id="an_avg">—</div><div class="ru">mean percentage</div></div>
+      <div class="rank-card"><div class="rk">Batch average</div><div class="rv" id="an_avg">—</div><div class="ru">mean SGPA</div></div>
       <div class="rank-card"><div class="rk">Lowest</div><div class="rv" id="an_low">—</div><div class="ru" id="an_low_usn"></div></div>
     </div>
     <div class="grid-2">
@@ -539,6 +540,7 @@ const $ = id => document.getElementById(id);
 
 /* ---------------- state ---------------- */
 let usnList = [];            // validated working list
+let lastFailedUsns = [];     // USNs that failed in the most recent run
 let invalidList = [];
 let batches = [];
 let batchStudents = {};      // batch_id -> students[]
@@ -848,6 +850,7 @@ socket.on("fetch-started", data => {
   $("stop_btn").disabled = false;
   $("stop_btn").textContent = "Stop";
   $("start_btn").disabled = true;
+  $("retry_btn").style.display = "none";
   fetchStartTime = Date.now();
   fetchTotal = data.total || null;
   $("timer_display").textContent = "00:00";
@@ -878,6 +881,23 @@ socket.on("fetch-complete", data => {
     $("progress_display").textContent = done + "/" + data.total;
   }
   logMsg("\n--- Fetch Complete ---\n");
+  lastFailedUsns = (data && data.failed) || [];
+  const rb = $("retry_btn");
+  if (rb) {
+    rb.textContent = lastFailedUsns.length ? `Retry failed (${lastFailedUsns.length})` : "Retry failed";
+    rb.style.display = lastFailedUsns.length ? "inline-flex" : "none";
+  }
+  if (lastFailedUsns.length) {
+    logMsg(`[Info] ${lastFailedUsns.length} USN(s) failed: ${lastFailedUsns.join(", ")}\n`);
+    toast(`${lastFailedUsns.length} USN(s) failed — use "Retry failed" to re-fetch only those`);
+  }
+});
+$("retry_btn").addEventListener("click", () => {
+  if (!lastFailedUsns.length) { toast("No failed USNs to retry"); return; }
+  usnList = [...lastFailedUsns];
+  renderList();
+  toast(`Loaded ${lastFailedUsns.length} failed USN(s) — fetching only those`);
+  $("start_btn").click();
 });
 socket.on("download-ready", () => {
   $("actions_panel").style.display = "block";
@@ -956,6 +976,27 @@ socket.on("batch-results", data => {
 });
 
 /* ---------------- analytics rendering ---------------- */
+function gradePoint(total) {
+  const m = Number(total);
+  if (isNaN(m)) return null;
+  if (m >= 90) return 10;
+  if (m >= 80) return 9;
+  if (m >= 70) return 8;
+  if (m >= 60) return 7;
+  if (m >= 55) return 6;
+  if (m >= 50) return 5;
+  if (m >= 40) return 4;
+  return 0;
+}
+
+/* SGPA from total marks using VTU grade points.
+   Credits are not scraped, so subjects are weighted equally. */
+function studentSGPA(s) {
+  const pts = (s.subjects || []).map(sub => gradePoint(sub.total)).filter(v => v !== null);
+  if (!pts.length) return null;
+  return pts.reduce((a, b) => a + b, 0) / pts.length;
+}
+
 function renderAnalytics(batch, students) {
   $("an_content").style.display = "block";
   $("an_empty").style.display = "none";
@@ -965,11 +1006,16 @@ function renderAnalytics(batch, students) {
   const top = sorted[0], low = sorted[sorted.length - 1];
   const avg = pct.length ? (pct.reduce((a, b) => a + b, 0) / pct.length).toFixed(2) : "—";
 
-  $("an_top").textContent = top ? top.percentage + "%" : "—";
-  $("an_top_usn").textContent = top ? `${top.usn} · ${top.name || ""}` : "";
-  $("an_avg").textContent = avg + "%";
-  $("an_low").textContent = low ? low.percentage + "%" : "—";
-  $("an_low_usn").textContent = low ? `${low.usn} · ${low.name || ""}` : "";
+  const sgpaList = students.map(s => ({ s, sg: studentSGPA(s) })).filter(x => x.sg !== null);
+  const sgSorted = sgpaList.slice().sort((a, b) => b.sg - a.sg);
+  const sgTop = sgSorted[0], sgLow = sgSorted[sgSorted.length - 1];
+  const sgAvg = sgpaList.length ? (sgpaList.reduce((a, x) => a + x.sg, 0) / sgpaList.length).toFixed(2) : "—";
+
+  $("an_top").textContent = sgTop ? sgTop.sg.toFixed(2) : "—";
+  $("an_top_usn").textContent = sgTop ? `${sgTop.s.usn} · ${sgTop.s.name || ""} · ${sgTop.s.percentage != null ? sgTop.s.percentage + "%" : "—"}` : "";
+  $("an_avg").textContent = sgAvg + "";
+  $("an_low").textContent = sgLow ? sgLow.sg.toFixed(2) : "—";
+  $("an_low_usn").textContent = sgLow ? `${sgLow.s.usn} · ${sgLow.s.name || ""} · ${sgLow.s.percentage != null ? sgLow.s.percentage + "%" : "—"}` : "";
 
   const byUsn = sorted.map(s => s.percentage ?? 0);
   const usnLabels = sorted.map(s => s.usn);
@@ -1090,6 +1136,20 @@ $("export_btn").addEventListener("click", () => {
   window.location.href = "/export-batch/" + match[0]._id;
 });
 
+/* VTU grade letter from total marks (mirrors the Excel generator). */
+function gradeOf(total) {
+  const m = Number(total);
+  if (isNaN(m)) return "";
+  if (m >= 90) return "O";
+  if (m >= 80) return "A+";
+  if (m >= 70) return "A";
+  if (m >= 60) return "B+";
+  if (m >= 55) return "B";
+  if (m >= 50) return "C";
+  if (m >= 40) return "P";
+  return "F";
+}
+
 function renderBrowseTable() {
   const table = $("browse_table");
   $("browse_count").textContent = browseRows.length + " record(s)";
@@ -1105,12 +1165,15 @@ function renderBrowseTable() {
   $("browse_prev").disabled = browsePage <= 1;
   $("browse_next").disabled = browsePage >= totalPages;
 
+  const COLS_PER_SUBJECT = 5;
   let html = "<thead><tr><th>USN</th><th>Name</th>";
-  subjectCodes.forEach(c => html += `<th class='num'>${c} Total</th>`);
+  subjectCodes.forEach(c => {
+    html += `<th class='num'>${c} Int</th><th class='num'>${c} Ext</th><th class='num'>${c} Total</th><th class='num'>${c} Grade</th><th class='num'>${c} Res</th>`;
+  });
   html += "<th class='num'>%</th><th>Status</th></tr></thead><tbody>";
 
   if (!pageRows.length) {
-    html += "<tr><td colspan='" + (4 + subjectCodes.length) + "' style='color:var(--muted);text-align:center;padding:24px;'>No records match the filters.</td></tr>";
+    html += "<tr><td colspan='" + (4 + subjectCodes.length * COLS_PER_SUBJECT) + "' style='color:var(--muted);text-align:center;padding:24px;'>No records match the filters.</td></tr>";
   }
   pageRows.forEach(r => {
     const subMap = {};
@@ -1118,7 +1181,16 @@ function renderBrowseTable() {
     html += `<tr><td>${r.usn}</td><td>${r.name || ""}</td>`;
     subjectCodes.forEach(c => {
       const s = subMap[c];
-      html += `<td class='num'>${s ? (s.total ?? "—") : "—"}</td>`;
+      const int = s && s.internal !== null && s.internal !== undefined ? s.internal : "—";
+      const ext = s && s.external !== null && s.external !== undefined ? s.external : "—";
+      const tot = s && s.total !== null && s.total !== undefined ? s.total : "—";
+      const grd = s && s.total !== null && s.total !== undefined ? gradeOf(s.total) : "—";
+      const res = s && s.result ? s.result : "—";
+      let totBg = "";
+      if (s && s.total !== null && s.total !== undefined) {
+        totBg = "background:#c8e6c9;";
+      }
+      html += `<td class='num'>${int}</td><td class='num'>${ext}</td><td class='num' style='${totBg}font-weight:600'>${tot}</td><td class='num'>${grd}</td><td class='num'>${res}</td>`;
     });
     const pct = r.percentage !== null && r.percentage !== undefined ? r.percentage + "%" : "—";
     html += `<td class='num'>${pct}</td>`;

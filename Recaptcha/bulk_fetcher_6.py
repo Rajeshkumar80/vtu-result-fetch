@@ -23,6 +23,8 @@ from selenium.common.exceptions import (
     TimeoutException, NoAlertPresentException, UnexpectedAlertPresentException, WebDriverException
 )
 
+from excel_header import HEADER_ROWS, DATA_HEADER_ROW, apply_header
+
 # -----------------------------------------
 # Config
 # -----------------------------------------
@@ -46,7 +48,7 @@ IMG_HEIGHT = 75
 CHARACTERS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 num_to_char = {i: c for i, c in enumerate(CHARACTERS)}
 
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 5
 
 
 # -----------------------------------------
@@ -103,6 +105,18 @@ def scrape(html):
     except Exception:
         pass
 
+    # --- Fallback identity: div-table layout (new VTU pages) ---
+    if usn == "UNKNOWN" or name == "UNKNOWN":
+        for row in soup.find_all("div", {"class": "divTableRow"}):
+            cells = row.find_all("div", {"class": "divTableCell"})
+            if len(cells) < 2:
+                continue
+            label = cells[0].get_text(strip=True)
+            if "University Seat Number" in label and usn == "UNKNOWN":
+                usn = cells[1].get_text(strip=True).replace(":", "").strip().upper()
+            elif "Student Name" in label:
+                name = cells[1].get_text(strip=True).replace(":", "").strip()
+
     # --- Fallback: find the USN pattern anywhere in the page ---
     if usn == "UNKNOWN" or not re.match(r"\d[A-Z]{2}\d{2}[A-Z]{2}\d{3}", usn):
         m = re.search(r"\d[A-Z]{2}\d{2}[A-Z]{2}\d{3}", html)
@@ -113,34 +127,38 @@ def scrape(html):
     sub_rows = []
     total, max_total = 0, 0
 
-    # --- Subject table: div-table layout ---
-    table_body = soup.find("div", {"class": "divTableBody"})
-    if table_body:
-        rows = table_body.find_all("div", {"class": "divTableRow"})
-        for r in rows:
-            c = r.find_all("div", {"class": "divTableCell"})
-            if len(c) != 7 or "Subject Code" in c[0].text:
-                continue
+    # --- Subject table: div-table layout (6 or 7 columns, both VTU layouts).
+    # Some pages carry several divTableBody blocks (identity / subjects /
+    # legend), so scan every divTableRow in the document. ---
+    rows = soup.find_all("div", {"class": "divTableRow"})
+    for r in rows:
+        c = r.find_all("div", {"class": "divTableCell"})
+        if len(c) < 6:
+            continue
+        code = c[0].text.strip()
+        # Skip header / legend / info rows: a subject code is a short
+        # alphanumeric token like BCS801, BINT803B, 20MATCS11
+        if "Subject Code" in code or not re.match(r"^[A-Za-z0-9]{2,8}$", code):
+            continue
 
-            code = c[0].text.strip()
-            tmarks = c[4].text.strip()
+        tmarks = c[4].text.strip()
 
-            sub_rows.append({
-                "Subject Code": code,
-                "Subject Name": c[1].text.strip(),
-                "Internal Marks": c[2].text.strip(),
-                "External Marks": c[3].text.strip(),
-                "Total Marks": tmarks,
-                "Result": c[5].text.strip(),
-                "Announced / Updated on": c[6].text.strip(),
-            })
+        sub_rows.append({
+            "Subject Code": code,
+            "Subject Name": c[1].text.strip(),
+            "Internal Marks": c[2].text.strip(),
+            "External Marks": c[3].text.strip(),
+            "Total Marks": tmarks,
+            "Result": c[5].text.strip(),
+            "Announced / Updated on": c[6].text.strip() if len(c) > 6 else "",
+        })
 
-            try:
-                total += int(tmarks)
-            except:
-                pass
+        try:
+            total += int(tmarks)
+        except:
+            pass
 
-            max_total += 100
+        max_total += 100
 
     # --- Fallback: any HTML table whose header row mentions "Subject Code" ---
     if not sub_rows:
@@ -241,8 +259,36 @@ def save_interim(all_subs, all_summ):
         print("[Warn] Could not save interim CSVs:", e)
 
 
+def _grade(marks):
+    """Map total marks to a VTU grade (per the standard grade table)."""
+    try:
+        m = float(marks)
+    except (TypeError, ValueError):
+        return ""
+    if m >= 90:
+        return "O"
+    if m >= 80:
+        return "A+"
+    if m >= 70:
+        return "A"
+    if m >= 60:
+        return "B+"
+    if m >= 55:
+        return "B"
+    if m >= 50:
+        return "C"
+    if m >= 40:
+        return "P"
+    return "F"
+
+
 def generate_excel():
-    """Rebuild vtu_results.xlsx from raw_results.csv + raw_summary.csv (SGPA added later by app.py)."""
+    """Rebuild vtu_results.xlsx from raw_results.csv + raw_summary.csv.
+    Layout: one row per student; columns grouped per subject
+    (Subject Name | Internal | External | Total | Grade | Result), then
+    Percentage / Overall Total / Overall Max Marks. Header styled,
+    panes frozen, sensible column widths.
+    """
     try:
         if not os.path.exists(RAW_DATA) or not os.path.exists(RAW_SUMMARY):
             print("[Warn] Raw CSVs not found — Excel not generated yet.")
@@ -258,6 +304,18 @@ def generate_excel():
         subs_df.drop_duplicates(inplace=True)
         summ_df.drop_duplicates(subset=["USN"], keep="last", inplace=True)
 
+        for df in (subs_df, summ_df):
+            for col in ("USN", "Name"):
+                if col in df.columns:
+                    df[col] = df[col].astype(str).str.strip()
+
+        codes = sorted(subs_df["Subject Code"].dropna().unique().tolist())
+        sub_info = {}
+        for _, r in subs_df.iterrows():
+            key = (str(r["USN"]).strip(), r["Subject Code"])
+            sub_info.setdefault(key, {})["name"] = str(r["Subject Name"])
+            sub_info[key]["grade"] = _grade(r["Total Marks"])
+
         pivot = pd.pivot_table(
             subs_df,
             index=["USN", "Name"],
@@ -265,9 +323,31 @@ def generate_excel():
             values=["Internal Marks", "External Marks", "Total Marks", "Result"],
             aggfunc="first"
         )
-        # flatten multiindex columns
         pivot.columns = [f"{c2} - {c1}" for c1, c2 in pivot.columns]
         pivot.reset_index(inplace=True)
+
+        # Reorder columns so every subject's block sits together:
+        # USN | Name | [Subject Name | Internal | External | Total | Grade | Result] per subject | Percentage | Overall Total | Overall Max Marks
+        order = ["USN", "Name"]
+        for code in codes:
+            order.append(f"{code} - Subject Name")
+            for suf in ("Internal Marks", "External Marks", "Total Marks", "Grade", "Result"):
+                order.append(f"{code} - {suf}")
+        for col in order:
+            if col not in pivot.columns:
+                pivot[col] = ""
+        pivot = pivot[order].copy()
+
+        pivot["USN"] = pivot["USN"].astype(str)
+        pivot["Name"] = pivot["Name"].astype(str)
+        for idx in pivot.index:
+            subkey = str(pivot.at[idx, "USN"])
+            for code in codes:
+                info = sub_info.get((subkey, code))
+                if info:
+                    pivot.at[idx, f"{code} - Subject Name"] = info.get("name", "")
+                    pivot.at[idx, f"{code} - Grade"] = info.get("grade", "")
+        pivot = pivot.replace({pd.NA: ""}).fillna("")
 
         summ_df["Percentage"] = summ_df["percentage"].apply(lambda x: f"{x:.2f}%" if isinstance(x, (int, float)) else "")
         summ_df = summ_df.rename(columns={
@@ -276,7 +356,11 @@ def generate_excel():
         })
 
         final = pd.merge(pivot, summ_df, on=["USN", "Name"], how="outer")
-        final.to_excel(OUTPUT_EXCEL, index=False)
+        final = final.replace({pd.NA: ""}).fillna("")
+        final = final.drop_duplicates(subset=["USN", "Name"], keep="last")
+        final.to_excel(OUTPUT_EXCEL, index=False, startrow=HEADER_ROWS)
+
+        _style_excel(OUTPUT_EXCEL, final.columns.tolist())
         print("[Success] Excel updated:", OUTPUT_EXCEL)
 
     except pd.errors.EmptyDataError:
@@ -288,13 +372,57 @@ def generate_excel():
         traceback.print_exc()
 
 
+def _style_excel(path, columns):
+    """Apply a clean look: college header block, bold header on a green fill,
+    frozen panes, per-column widths and an autofilter."""
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        wb = load_workbook(path)
+        ws = wb.active
+
+        head_fill = PatternFill("solid", fgColor="1C7A5E")
+        head_font = Font(bold=True, color="FFFFFF", size=11)
+        thin = Side(style="thin", color="C8D6CE")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        for cell in ws[DATA_HEADER_ROW]:
+            cell.fill = head_fill
+            cell.font = head_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+
+        widths = {"USN": 14, "Name": 28}
+        for i, col in enumerate(columns, start=1):
+            base = "USN" if col == "USN" else "Name" if col == "Name" else "subj" if "Subject Name" in col else "mark" if col in ("Percentage", "Overall Total", "Overall Max Marks") else "num"
+            ws.column_dimensions[ws.cell(row=DATA_HEADER_ROW, column=i).column_letter].width = widths.get(base, 12 if base == "num" else 34 if base == "subj" else 14)
+        for row in ws.iter_rows(min_row=DATA_HEADER_ROW + 1):
+            for cell in row:
+                cell.border = border
+
+        apply_header(ws, len(columns))
+        ws.freeze_panes = f"C{DATA_HEADER_ROW + 1}"
+        ws.auto_filter.ref = f"A{DATA_HEADER_ROW}:{get_column_letter(len(columns))}{ws.max_row}"
+        wb.save(path)
+    except Exception as e:
+        print("[Warn] Excel styling skipped:", e)
+
+
 # -----------------------------------------
 # Browser management (with auto-restart on crash)
 # -----------------------------------------
 def start_driver():
     """Create a fresh Chrome WebDriver."""
+    options = webdriver.ChromeOptions()
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--log-level=3")
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
     service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service)
+    return webdriver.Chrome(service=service, options=options)
 
 
 def browser_alive(driver):
