@@ -1,71 +1,39 @@
-"""College header block for the result Excel files (shared by the live fetch
-and the batch-export paths).
+"""Header block for the result Excel files (shared by the live fetch and the
+batch-export paths).
 
-Layout (rows 1-4 are the header, row 5 a spacer, data starts at row 6):
-  A            | B ... last column ... | last column
-  [college logo]  Gopalan College of Engineering and Management
-                  Accredited by NAAC, Recognized under 2(f) by UGC, ISO 9001:2015 certified
-                  Approved by All India Council for Technical Education (AICTE), New Delhi
-                  Affiliated to Visvesvaraya Technological University (VTU), Belagavi,
-                  Karnataka Recognized by Govt. of Karnataka
+Layout: row 1 = the header_banner.jpeg image (centered), row 2 = spacer,
+data starts at row 3. Nothing else.
 """
 
 import os
 
-from openpyxl.styles import Font, Alignment, PatternFill
+from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.units import pixels_to_EMU
 from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-COLLEGE_LOGO = os.path.join(BASE_DIR, "college_logo.png")
+BANNER_IMAGE = os.path.join(BASE_DIR, "header_banner.jpeg")
 
-HEADER_ROWS = 5
-DATA_HEADER_ROW = HEADER_ROWS + 1  # row 6
+HEADER_ROWS = 2
+DATA_HEADER_ROW = HEADER_ROWS + 1  # row 3
 
-DARK_BLUE = "1F3864"
-GRAY = "808080"
-
-LOGO_HEIGHT_PX = 90
-LOGO_Y_OFFSET_PX = 15
-
-COLLEGE_NAME = "Gopalan College of Engineering and Management"
-SUBLINES = [
-    "Accredited by NAAC, Recognized under 2(f) by UGC, ISO 9001:2015 certified",
-    "Approved by All India Council for Technical Education (AICTE), New Delhi Affiliated to Visvesvaraya Technological",
-    "University (VTU), Belagavi, Karnataka Recognized by Govt. of Karnataka",
-]
-ROW_HEIGHTS = [36, 18, 18, 18, 8]  # rows 1-5
+BANNER_HEIGHT_PX = 78
+BANNER_Y_OFFSET_PX = 6
+ROW_HEIGHTS = [70, 8]  # rows 1-2
 
 
 def apply_header(ws, last_col):
-    """Write the college title block into rows 1-4 and anchor the logo at the
-    left edge of the worksheet, vertically centered over the header block.
+    """Write the banner image into row 1, centered across the table width.
     last_col = number of data columns (int)."""
     try:
-        last_letter = get_column_letter(max(last_col, 2))
-
-        ws.merge_cells(f"B1:{last_letter}1")
-        c = ws["B1"]
-        c.value = COLLEGE_NAME
-        c.font = Font(name="Calibri", size=18, bold=True, color=DARK_BLUE)
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         ws.row_dimensions[1].height = ROW_HEIGHTS[0]
-
-        for i, text in enumerate(SUBLINES, start=2):
-            ws.merge_cells(f"B{i}:{last_letter}{i}")
-            c = ws[f"B{i}"]
-            c.value = text
-            c.font = Font(name="Calibri", size=9, color=GRAY)
-            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            ws.row_dimensions[i].height = ROW_HEIGHTS[i - 1]
-
-        ws.row_dimensions[5].height = ROW_HEIGHTS[4]
+        ws.row_dimensions[2].height = ROW_HEIGHTS[1]
 
         _blank_header_cells(ws, last_col)
-        _anchor_logo(ws)
+        _anchor_banner(ws, last_col)
     except Exception as e:
-        print("[Warn] College header skipped:", e)
+        print("[Warn] Header skipped:", e)
 
 
 def _blank_header_cells(ws, last_col):
@@ -82,24 +50,29 @@ def _blank_header_cells(ws, last_col):
         print("[Warn] Header cell blanking skipped:", e)
 
 
-def _anchor_logo(ws):
-    """Place the college logo at absolute cell A1 using an explicit one-cell
-    anchor, sized ~90px high so it visually spans the header block instead of
-    being squeezed into the first cell."""
+def _anchor_banner(ws, last_col):
+    """Place the wide banner image in row 1, horizontally centered across the
+    full table width, using an explicit one-cell anchor with pixel offset."""
     try:
         from openpyxl.drawing.image import Image as XLImage
         from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
         from openpyxl.drawing.xdr import XDRPositiveSize2D
 
-        if not os.path.exists(COLLEGE_LOGO):
+        if not os.path.exists(BANNER_IMAGE):
             return
 
-        img = XLImage(COLLEGE_LOGO)
-        img.height = LOGO_HEIGHT_PX
-        img.width = int(LOGO_HEIGHT_PX * _aspect(COLLEGE_LOGO))
+        img = XLImage(BANNER_IMAGE)
+        img.height = BANNER_HEIGHT_PX
+        img.width = int(BANNER_HEIGHT_PX * _aspect(BANNER_IMAGE))
 
+        total_px = 0
+        for c in range(1, max(last_col, 2) + 1):
+            w = ws.column_dimensions[get_column_letter(c)].width
+            total_px += int((w if w else 8.43) * 7 + 5)
+
+        off_px = max(0, int((total_px - img.width) / 2))
         marker = AnchorMarker(
-            col=0, colOff=0, row=0, rowOff=pixels_to_EMU(LOGO_Y_OFFSET_PX)
+            col=0, colOff=pixels_to_EMU(off_px), row=0, rowOff=pixels_to_EMU(BANNER_Y_OFFSET_PX)
         )
         img.anchor = OneCellAnchor(
             _from=marker,
@@ -110,7 +83,7 @@ def _anchor_logo(ws):
         )
         ws.add_image(img)
     except Exception as e:
-        print("[Warn] Logo embedding skipped:", e)
+        print("[Warn] Banner embedding skipped:", e)
 
 
 def _aspect(path):
