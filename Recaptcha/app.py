@@ -204,6 +204,19 @@ def filters_semesters():
     return jsonify(_filter_values("semester", SEMESTER_PRESETS))
 
 
+@app.route("/api/student-record/<usn>")
+def student_record(usn):
+    records, err = db.find_student_records(usn)
+    if err:
+        return jsonify({"error": err}), 404
+    name = ""
+    for r in records:
+        if r.get("name"):
+            name = r["name"]
+            break
+    return jsonify({"name": name, "records": records})
+
+
 @app.route("/api/filters/schemes")
 def filters_schemes():
     return jsonify(_filter_values("scheme", SCHEME_PRESETS, reverse=True))

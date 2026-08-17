@@ -290,6 +290,61 @@ table.data tbody td { padding: 9px 13px; border-bottom: 1px solid #eff2f6; white
 table.data tbody tr:nth-child(even) { background: #fafcfd; }
 table.data tbody tr:hover { background: var(--accent-soft); }
 table.data td.num, table.data th.num { text-align: right; font-variant-numeric: tabular-nums; }
+table.data.mini { width: auto; min-width: 300px; font-size: 12px; }
+table.data.mini thead th { position: static; background: #f7fafb; padding: 6px 9px; font-size: 10.5px; }
+table.data.mini tbody td { padding: 6px 9px; }
+table.data.mini tbody tr:nth-child(even) { background: #fdfefe; }
+table.data.mini tbody tr:hover { background: transparent; }
+.sr-head {
+  display: flex; justify-content: space-between; align-items: center; gap: 14px;
+  padding: 20px 26px; margin-bottom: 20px; border-radius: 14px;
+  background: linear-gradient(135deg, #0f3d2e 0%, #1C7A5E 100%);
+  color: #fff; box-shadow: 0 10px 24px rgba(28, 122, 94, .28);
+}
+.sr-label { font-size: 11px; text-transform: uppercase; letter-spacing: .16em; opacity: .78; font-weight: 700; }
+.sr-name { font-size: 26px; font-weight: 800; letter-spacing: .03em; margin-top: 5px; line-height: 1.1; }
+.sr-head-right { text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+.sr-usn {
+  font-size: 13.5px; font-weight: 800; letter-spacing: .08em;
+  background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.25);
+  padding: 7px 16px; border-radius: 999px; font-variant-numeric: tabular-nums;
+}
+.sr-sub { font-size: 12px; opacity: .8; }
+
+/* ---------- print / PDF export (keeps layout + colors) ---------- */
+@media print {
+  @page { size: A4 landscape; margin: 10mm; }
+  body > *:not(#sr_overlay) { display: none !important; }
+  #sr_overlay {
+    display: block !important;
+    position: static !important;
+    inset: auto !important;
+    background: #fff !important;
+    overflow: visible !important;
+    z-index: auto !important;
+  }
+  #sr_overlay > .panel { max-width: 100% !important; margin: 0 !important; box-shadow: none !important; border: none !important; }
+  #sr_overlay > .panel > .row { display: none !important; }
+  #sr_result { display: block !important; }
+  #sr_overlay .panel { break-inside: auto; }
+  .tbl-wrap {
+    overflow: visible !important;
+    max-height: none !important;
+    border: none !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+  }
+  table.data { width: 100% !important; }
+  table.data thead th { position: static !important; }
+  table.data tbody td, table.data thead th { white-space: nowrap; }
+  table.data, table.data thead th, table.data tbody td { border-color: #cfd8dd !important; }
+  table.data thead th, table.data.mini thead th { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  .sr-head { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+}
 .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 700; }
 .pill::before { content: ""; width: 6px; height: 6px; border-radius: 99px; }
 .pill.pass { background: #e9fbf1; color: var(--ok); } .pill.pass::before { background: var(--ok); }
@@ -469,6 +524,14 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
       <div class="panel"><h3>Result breakdown</h3><div class="chart-box"><canvas id="chart_pie"></canvas></div></div>
     </div>
     <div class="panel"><h3>Subject-wise average (total marks)</h3><div class="chart-box"><canvas id="chart_subj"></canvas></div></div>
+    <div class="panel" id="an_failed_panel" style="display:none;">
+      <h3>Failed students <span class="preview-count" id="an_failed_count" style="margin-left:8px;"></span></h3>
+      <div style="margin-bottom:10px;color:var(--muted);" id="an_failed_hint"></div>
+      <div class="tbl-wrap"><table class="data" id="an_failed_tbl">
+        <thead><tr><th>#</th><th>USN</th><th>Name</th><th>Failed subject(s)</th><th>Count</th><th>%</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
   </div>
 </section>
 
@@ -481,6 +544,7 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
       <div><label class="lbl">Semester</label><select id="flt_sem"></select></div>
       <div><label class="lbl">Scheme</label><select id="flt_scheme"></select></div>
       <div><label class="lbl">Year</label><select id="flt_year"></select></div>
+      <div style="flex:0 0 auto;align-self:flex-end;"><button class="btn ghost" id="sr_open_btn" type="button">Student record</button></div>
       <div style="flex:0 0 auto;align-self:flex-end;"><button class="btn" id="export_btn" disabled>Export to Excel</button></div>
     </div>
   </div>
@@ -533,6 +597,29 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
 </div>
 
 <div id="toast"></div>
+
+<!-- ================= STUDENT RECORD MODAL ================= -->
+<div id="sr_overlay" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:1000;overflow:auto;">
+  <div class="panel" style="max-width:1100px;margin:48px auto 32px;background:var(--panel);box-shadow:0 24px 64px rgba(0,0,0,.35);">
+    <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px;">
+      <h2 style="margin:0;"><span class="h2-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>Student record</h2>
+      <div class="row" style="gap:10px;align-items:center;">
+        <button class="btn" id="sr_print_btn" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;vertical-align:-2px;"><path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+          Print / Save as PDF
+        </button>
+        <button class="btn ghost" id="sr_close_btn" type="button">&times; Close</button>
+      </div>
+    </div>
+    <div class="row" style="gap:10px;margin-bottom:20px;flex-wrap:wrap;">
+      <label class="lbl" style="align-self:center;margin:0;">USN</label>
+      <input type="text" id="sr_usn" placeholder="e.g. 1GD23CS001" style="width:220px;text-transform:uppercase;">
+      <button class="btn" id="sr_view_btn" type="button">View record</button>
+      <span class="preview-count" id="sr_msg" style="align-self:center;color:var(--err);"></span>
+    </div>
+    <div id="sr_result" style="display:none;"></div>
+  </div>
+</div>
 
 <script>
 const socket = io();
@@ -1065,6 +1152,32 @@ function renderAnalytics(batch, students) {
       plugins: { legend: { display: false } },
       scales: { y: { beginAtZero: true, grid: { color: "#eef1f5" }, ticks: { color: "#48506d" } }, x: { grid: { display: false }, ticks: { color: "#48506d", maxRotation: 45 } } } }
   });
+
+  const failed = students
+    .map(s => ({ s, failedSubs: (s.subjects || []).filter(sub => sub.result === "F" || (typeof sub.total === "number" && sub.total < 40)) }))
+    .filter(x => x.failedSubs.length > 0);
+  const panel = $("an_failed_panel");
+  if (failed.length) {
+    panel.style.display = "block";
+    $("an_failed_count").textContent = failed.length + " of " + students.length + " student(s)";
+    $("an_failed_hint").textContent = "Students with at least one failed subject (result F / total below 40).";
+    let fh = "";
+    failed.forEach((x, i) => {
+      const rows = x.failedSubs.map(sub => {
+        const int = sub.internal !== null && sub.internal !== undefined ? sub.internal : "—";
+        const ext = sub.external !== null && sub.external !== undefined ? sub.external : "—";
+        const tot = sub.total !== null && sub.total !== undefined ? sub.total : "—";
+        const grd = tot !== "—" ? gradeOf(sub.total) : "—";
+        const res = sub.result || "—";
+        return `<tr><td>${sub.code || sub.name || "?"}</td><td class='num'>${int}</td><td class='num'>${ext}</td><td class='num' style='font-weight:600'>${tot}</td><td class='num'>${grd}</td><td class='num'>${res}</td></tr>`;
+      }).join("");
+      const pct = x.s.percentage !== null && x.s.percentage !== undefined ? x.s.percentage + "%" : "—";
+      fh += `<tr><td>${i + 1}</td><td>${x.s.usn}</td><td>${x.s.name || ""}</td><td><table class='data mini'><thead><tr><th>Subject</th><th class='num'>Int</th><th class='num'>Ext</th><th class='num'>Total</th><th class='num'>Grade</th><th class='num'>Res</th></tr></thead><tbody>${rows}</tbody></table></td><td>${x.failedSubs.length}</td><td>${pct}</td></tr>`;
+    });
+    $("an_failed_tbl").querySelector("tbody").innerHTML = fh;
+  } else {
+    panel.style.display = "none";
+  }
 }
 
 function destroyChart(name) {
@@ -1127,6 +1240,7 @@ function applyBrowseFilters() {
   match.forEach(b => {
     (batchStudents[b._id] || []).forEach(s => browseRows.push({ batchId: b._id, ...s }));
   });
+  browseRows.sort((a, b) => (a.usn || "").localeCompare(b.usn || "", undefined, { numeric: true }));
   renderBrowseTable();
 }
 
@@ -1209,6 +1323,126 @@ $("page_size").addEventListener("change", e => {
   browsePage = 1;
   renderBrowseTable();
 });
+
+/* ---------------- student record dashboard ---------------- */
+function semNumOf(semLabel) {
+  const m = String(semLabel || "").match(/\d+/);
+  return m ? parseInt(m[0], 10) : 0;
+}
+
+function semSGPA(rec) {
+  const pts = (rec.subjects || []).map(sub => gradePoint(sub.total)).filter(v => v !== null);
+  if (!pts.length) return null;
+  return pts.reduce((a, b) => a + b, 0) / pts.length;
+}
+
+function semBacklogs(rec) {
+  return (rec.subjects || []).filter(sub => sub.result === "F" || (typeof sub.total === "number" && sub.total < 40)).length;
+}
+
+function renderStudentRecord(data) {
+  const box = $("sr_result");
+  box.style.display = "block";
+  const name = data.name || (data.records[0] && data.records[0].name) || "—";
+
+  const perSem = {};
+  data.records.forEach(r => { perSem[semNumOf(r.semester)] = r; });
+
+  const sems = [];
+  for (let i = 1; i <= 8; i++) sems.push(perSem[i] || null);
+
+  const sgpaList = sems.filter(Boolean).map(semSGPA).filter(v => v !== null);
+  const mean = sgpaList.length ? (sgpaList.reduce((a, b) => a + b, 0) / sgpaList.length).toFixed(2) : "—";
+  const totalBacklogs = sems.filter(Boolean).reduce((a, r) => a + semBacklogs(r), 0);
+
+  let sum = "";
+  sum += "<div class='sr-head'>";
+  sum += "<div class='sr-head-left'>";
+  sum += "<div class='sr-label'>Student name</div>";
+  sum += `<div class='sr-name'>${name}</div>`;
+  sum += "</div>";
+  sum += "<div class='sr-head-right'>";
+  sum += `<div class='sr-usn'>${data.records[0].usn || "—"}</div>`;
+  sum += `<div class='sr-sub'>${data.records.length} semester result(s)</div>`;
+  sum += "</div>";
+  sum += "</div>";
+
+  sum += "<div class='tbl-wrap' style='margin-bottom:22px;'><table class='data'>";
+  sum += "<thead><tr><th>1st</th><th>2nd</th><th>3rd</th><th>4th</th><th>5th</th><th>6th</th><th>7th</th><th>8th</th><th class='num'>Mean CGPA</th><th class='num'>Number of Backlogs</th></tr></thead><tbody><tr>";
+  sems.forEach(r => {
+    const sg = r ? semSGPA(r) : null;
+    sum += `<td class='num'>${r ? (sg !== null ? sg.toFixed(2) : "—") : "—"}</td>`;
+  });
+  sum += `<td class='num' style='font-weight:700;background:#eaf6f0;'>${mean}</td>`;
+  sum += `<td class='num' style='font-weight:700;${totalBacklogs > 0 ? "color:var(--err);" : ""}'>${totalBacklogs}</td>`;
+  sum += "</tr></tbody></table></div>";
+
+  data.records.forEach(r => {
+    const sg = semSGPA(r);
+    const bl = semBacklogs(r);
+    sum += `<div class='panel' style='margin-bottom:16px;'>`;
+    sum += `<h3 style='margin-bottom:10px;'>Semester ${semNumOf(r.semester)} <span class='preview-count' style='margin-left:8px;'>${r.scheme || "—"} · ${r.year || "—"}</span>`;
+    if (sg !== null) sum += `<span class='preview-count' style='margin-left:8px;'>SGPA ${sg.toFixed(2)}</span>`;
+    if (bl > 0) sum += `<span class='preview-count' style='margin-left:8px;color:var(--err);'>${bl} backlog(s)</span>`;
+    sum += `</h3>`;
+    sum += "<div class='tbl-wrap'><table class='data'><thead><tr><th>#</th><th>Subject Code</th><th>Subject Name</th><th class='num'>Int</th><th class='num'>Ext</th><th class='num'>Total</th><th class='num'>Grade</th><th class='num'>Res</th></tr></thead><tbody>";
+    (r.subjects || []).forEach((sub, i) => {
+      const int = sub.internal !== null && sub.internal !== undefined ? sub.internal : "—";
+      const ext = sub.external !== null && sub.external !== undefined ? sub.external : "—";
+      const tot = sub.total !== null && sub.total !== undefined ? sub.total : "—";
+      const grd = tot !== "—" ? gradeOf(sub.total) : "—";
+      const res = sub.result || "—";
+      const isF = res === "F" || (typeof sub.total === "number" && sub.total < 40);
+      sum += `<tr><td>${i + 1}</td><td>${sub.code || "?"}</td><td>${sub.subject_name || ""}</td><td class='num'>${int}</td><td class='num'>${ext}</td><td class='num' style='font-weight:600;${isF ? "color:var(--err);" : ""}'>${tot}</td><td class='num'>${grd}</td><td class='num' style='${isF ? "color:var(--err);font-weight:700;" : ""}'>${res}</td></tr>`;
+    });
+    sum += "</tbody></table></div></div>";
+  });
+
+  box.innerHTML = sum;
+}
+
+function openStudentRecord() {
+  $("sr_overlay").style.display = "block";
+  $("sr_msg").textContent = "";
+  $("sr_result").style.display = "none";
+  $("sr_usn").value = "";
+  $("sr_usn").focus();
+}
+
+function closeStudentRecord() {
+  $("sr_overlay").style.display = "none";
+}
+
+async function viewStudentRecord() {
+  const usn = $("sr_usn").value.trim();
+  const msg = $("sr_msg");
+  if (!usn) { msg.textContent = "Enter a USN first."; return; }
+  msg.textContent = "Searching\u2026";
+  $("sr_result").style.display = "none";
+  try {
+    const r = await fetch("/api/student-record/" + encodeURIComponent(usn));
+    const data = await r.json();
+    if (!r.ok || data.error) {
+      msg.textContent = data.error || "Failed to load record.";
+      return;
+    }
+    msg.textContent = "";
+    renderStudentRecord(data);
+  } catch (e) {
+    msg.textContent = "Network error while loading record.";
+  }
+}
+
+$("sr_open_btn").addEventListener("click", openStudentRecord);
+$("sr_close_btn").addEventListener("click", closeStudentRecord);
+$("sr_print_btn").addEventListener("click", () => {
+  if ($("sr_result").style.display === "none") { toast("View a student record first"); return; }
+  window.print();
+});
+$("sr_overlay").addEventListener("click", e => { if (e.target === $("sr_overlay")) closeStudentRecord(); });
+$("sr_view_btn").addEventListener("click", viewStudentRecord);
+$("sr_usn").addEventListener("keydown", e => { if (e.key === "Enter") viewStudentRecord(); });
+
 renderList();
 loadFilterOptions();
 </script>

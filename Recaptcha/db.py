@@ -6,6 +6,7 @@ gracefully (returns empty results / error messages) — the app keeps working.
 """
 
 import os
+import re
 from datetime import datetime
 
 try:
@@ -234,11 +235,11 @@ def fetch_batch(batch_id):
 
 
 def fetch_students(batch_id):
-    """Return student docs for one batch (JSON-safe) or []."""
+    """Return student docs for one batch (JSON-safe) or [], sorted by USN."""
     if not is_connected() or not ObjectId.is_valid(batch_id):
         return []
     try:
-        docs = list(_students_coll().find({"batch_id": ObjectId(batch_id)}))
+        docs = list(_students_coll().find({"batch_id": ObjectId(batch_id)}).sort("usn", 1))
         return [_jsonable(d) for d in docs]
     except PyMongoError as e:
         print(f"[MongoDB] fetch_students error: {e}")
@@ -251,3 +252,42 @@ def fetch_batch_with_students(batch_id):
     if batch is None:
         return None, None
     return batch, fetch_students(batch_id)
+
+
+def _sem_num(semester):
+    """Extract the numeric part of a semester label for sorting (Sem 6 -> 6)."""
+    m = re.search(r"\d+", str(semester or ""))
+    return int(m.group()) if m else 0
+
+
+def find_student_records(usn):
+    """Return every saved result for a USN across all batches, sorted by semester.
+    Returns (records, "") on success, (None, error) otherwise.
+    Each record: {semester, scheme, year, batch_id, name, percentage, subjects}."""
+    if not is_connected():
+        return None, "MongoDB not connected"
+    try:
+        pattern = re.compile("^" + re.escape(str(usn).strip().upper()) + "$", re.IGNORECASE)
+        studs = list(_students_coll().find({"usn": pattern}))
+        if not studs:
+            return None, "No records found for USN " + str(usn).strip()
+        batch_ids = list({ObjectId(str(s["batch_id"])) for s in studs if s.get("batch_id")})
+        batches = list(_batches_coll().find({"_id": {"$in": batch_ids}}))
+        bmap = {str(b["_id"]): b for b in batches}
+        records = []
+        for s in studs:
+            b = bmap.get(str(s.get("batch_id"))) or {}
+            records.append({
+                "usn": str(s.get("usn") or ""),
+                "semester": str(b.get("semester") or ""),
+                "scheme": str(b.get("scheme") or ""),
+                "year": str(b.get("year") or ""),
+                "batch_id": str(s.get("batch_id") or ""),
+                "name": str(s.get("name") or ""),
+                "percentage": s.get("percentage"),
+                "subjects": s.get("subjects", []),
+            })
+        records.sort(key=lambda r: _sem_num(r["semester"]))
+        return records, ""
+    except PyMongoError as e:
+        return None, str(e)
